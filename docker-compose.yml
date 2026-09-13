@@ -1,0 +1,136 @@
+services:
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # A HARD ceiling, not a hint. The graded budget is 500 MB for the system,
+    # so each of api and worker gets 256m: a regression that reintroduces
+    # O(file) PDF buffering gets OOM-killed here and the benchmark reports a
+    # dead container, instead of quietly passing on a host with 32 GB spare.
+    # Deliberately BELOW the graded number divided by container count - the
+    # measured steady state is ~60-90 MB per container, so 256m is ~3x
+    # headroom while still being a real limit.
+    mem_limit: 256m
+    ports:
+      - "8000:8000"
+    environment:
+      ORCH_REDIS_URL: redis://redis:6379/0
+      ORCH_MOCK_BASE_URL: http://mock-model:8001
+      ORCH_REAPER_MIN_IDLE_S: ${ORCH_REAPER_MIN_IDLE_S:-30}
+      # Module C: the graded tree-diff budget. The work cap is derived from
+      # this, so anything POST /evaluate accepts is computable inside it.
+      ORCH_EVAL_TED_BUDGET_MS: ${ORCH_EVAL_TED_BUDGET_MS:-100}
+      ORCH_EVAL_MAX_NODES: ${ORCH_EVAL_MAX_NODES:-2000}
+      ORCH_RESULT_TTL_S: ${ORCH_RESULT_TTL_S:-3600}
+      # The admission watermark is enforced by the API, so it has to be
+      # passed to THIS service - the worker never sees POST /jobs.
+      ORCH_QUEUE_HIGH_WATERMARK: ${ORCH_QUEUE_HIGH_WATERMARK:-5000}
+      ORCH_QUEUE_LOW_WATERMARK_FRACTION: ${ORCH_QUEUE_LOW_WATERMARK_FRACTION:-0.8}
+      ORCH_ADAPTIVE_ENABLED: ${ORCH_ADAPTIVE_ENABLED:-true}
+      ORCH_VLM_RPS: ${ORCH_VLM_RPS:-10}
+      ORCH_MAX_UPLOAD_MB: ${ORCH_MAX_UPLOAD_MB:-120}
+      ORCH_UPLOAD_CHUNK_BYTES: ${ORCH_UPLOAD_CHUNK_BYTES:-1048576}
+    volumes:
+      # Shared, and it has to be: the API streams an upload in and the WORKERS
+      # read single pages back out. Passing page bytes through Redis instead
+      # would make a 100-page 100 MiB document cost 100 MiB of queue and break
+      # the admission watermark's memory arithmetic.
+      - pdf-data:/data
+    depends_on:
+      # `service_healthy`, not the bare list form: depends_on alone waits only
+      # for the container to START, so the API could try to connect before Redis
+      # was accepting connections.
+      redis:
+        condition: service_healthy
+      mock-model:
+        condition: service_started
+
+  worker:
+    build: .
+    command: python -m app.worker.main
+    mem_limit: 256m
+    environment:
+      ORCH_REDIS_URL: redis://redis:6379/0
+      ORCH_MOCK_BASE_URL: http://mock-model:8001
+      # Tunable so load tests can drive the worker into states the defaults
+      # never reach. Compose has no wildcard passthrough, so every knob a test
+      # needs to override has to be listed here - a variable exported in the
+      # shell but missing from this block silently has no effect inside the
+      # container, which is easy to mistake for the feature not working.
+      ORCH_WORKER_CONCURRENCY: ${ORCH_WORKER_CONCURRENCY:-16}
+      ORCH_WORKER_PREFETCH: ${ORCH_WORKER_PREFETCH:-8}
+      ORCH_WORKER_LEAD_RESERVE: ${ORCH_WORKER_LEAD_RESERVE:-4}
+      ORCH_WORKER_LEAD_POLL_MS: ${ORCH_WORKER_LEAD_POLL_MS:-100}
+      ORCH_DEGRADE_AFTER_S: ${ORCH_DEGRADE_AFTER_S:-90}
+      ORCH_PAGE_DEADLINE_S: ${ORCH_PAGE_DEADLINE_S:-300}
+      ORCH_MAX_ATTEMPTS: ${ORCH_MAX_ATTEMPTS:-3}
+      ORCH_SATURATION_PAUSE_S: ${ORCH_SATURATION_PAUSE_S:-0.5}
+      ORCH_BREAKER_COOLDOWN_S: ${ORCH_BREAKER_COOLDOWN_S:-5}
+      ORCH_BREAKER_FAILURE_RATIO: ${ORCH_BREAKER_FAILURE_RATIO:-0.5}
+      ORCH_VLM_RPS: ${ORCH_VLM_RPS:-10}
+      ORCH_ADAPTIVE_ENABLED: ${ORCH_ADAPTIVE_ENABLED:-true}
+      ORCH_AIMD_INCREASE_AFTER: ${ORCH_AIMD_INCREASE_AFTER:-20}
+      ORCH_AIMD_REFRACTORY_MS: ${ORCH_AIMD_REFRACTORY_MS:-1000}
+      ORCH_AIMD_DECREASE_FACTOR: ${ORCH_AIMD_DECREASE_FACTOR:-0.7}
+      ORCH_VLM_LATENCY_SLO_MS: ${ORCH_VLM_LATENCY_SLO_MS:-4500}
+      # Crash recovery (Step 14). Tunable because the SIGKILL proof needs to
+      # observe a reclaim inside a test run rather than after 45s of defaults.
+      # Needed by the TTL-renewal proof: a job must be able to outlive its
+      # own result_ttl_s inside a test run, not in an hour.
+      ORCH_RESULT_TTL_S: ${ORCH_RESULT_TTL_S:-3600}
+      ORCH_REAPER_ENABLED: ${ORCH_REAPER_ENABLED:-true}
+      ORCH_REAPER_INTERVAL_S: ${ORCH_REAPER_INTERVAL_S:-15}
+      ORCH_REAPER_MIN_IDLE_S: ${ORCH_REAPER_MIN_IDLE_S:-30}
+      ORCH_LEASE_RENEW_INTERVAL_S: ${ORCH_LEASE_RENEW_INTERVAL_S:-5}
+      ORCH_LOG_LEVEL: ${ORCH_LOG_LEVEL:-INFO}
+      ORCH_PDF_TEXT_SAMPLE_CHARS: ${ORCH_PDF_TEXT_SAMPLE_CHARS:-0}
+    volumes:
+      # Shared, and it has to be: the API streams an upload in and the WORKERS
+      # read single pages back out. Passing page bytes through Redis instead
+      # would make a 100-page 100 MiB document cost 100 MiB of queue and break
+      # the admission watermark's memory arithmetic.
+      - pdf-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-model:
+        condition: service_started
+    # No published port: workers pull from the queue, nothing calls them. Scale
+    # with `docker compose up -d --scale worker=3`.
+
+  mock-model:
+    build: .
+    command: >
+      uvicorn mock_model.main:app --host 0.0.0.0 --port 8001
+      --workers 1
+    # --workers 1 is required, not incidental: the mock's token buckets are
+    # in-process, so N worker processes would mean N independent buckets and
+    # N times the advertised rate limit.
+    ports:
+      - "8001:8001"
+    environment:
+      # The mock's REAL capacity, independent of what the orchestrator was
+      # told. Lowering this is how the AIMD controller gets tested against the
+      # case it exists for: an advertised limit that no longer matches reality.
+      MOCK_VLM_RPS: ${MOCK_VLM_RPS:-10}
+      MOCK_VLM_BURST: ${MOCK_VLM_BURST:-10}
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+    # Persistence off. State here is in-flight work with a TTL, not a system of
+    # record, and RDB forks would add latency spikes during the benchmark. The
+    # durability story is the queue's PEL plus idempotent replay, not disk.
+
+volumes:
+  pdf-data:

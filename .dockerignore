@@ -1,0 +1,14 @@
+# The Dockerfile does `COPY . .`, so anything not excluded here lands in the
+# image. The host venv is both large and platform-wrong (Windows binaries in a
+# Linux image), and could shadow the container's own site-packages.
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.git/
+.gitignore
+.env
+data/
+*.md

@@ -1,0 +1,27 @@
+fastapi
+uvicorn[standard]
+# >=6.0.2 is the first release with cp313 wheels; older versions try to compile
+# against Cython and fail on Python 3.13.
+PyYAML>=6.0.2
+redis
+httpx
+python-multipart
+pydantic-settings
+structlog
+pytest
+pytest-asyncio
+
+# Pure Python, so there is no C extension to compile - the same class of
+# problem that PyYAML's cp313 wheels caused earlier in this build.
+# Read lazily from a PATH (never from bytes), which is what keeps page
+# extraction O(page) instead of O(file).
+pypdf>=5.1.0
+
+
+# Required by tests/test_pdf_splitter.py, which asserts the O(page) memory
+# bound by sampling this process's RSS. It was previously installed ad hoc
+# inside a running container and therefore vanished on the next recreate,
+# silently turning the one test that guards a GRADED metric (peak RSS < 500MB)
+# into a collection error. A dependency an assertion depends on is not
+# optional.
+psutil
