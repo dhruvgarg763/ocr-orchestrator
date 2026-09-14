@@ -175,6 +175,11 @@ costs 2, not 1.
    redelivery inflates `orch_pages_terminal_total{result="success"}`, so the
    zero-drop figure is read from `state_counts` instead.
 6. Single Redis is the SPOF for queue and page state.
+7. The graded benchmark submits synthetic `{"pages": N}` jobs, not real PDFs,
+   to isolate queue/dispatch cost from parsing cost - but that means it never
+   exercises the literal "50 concurrent PDF ingestions" the RSS target names.
+   Measured separately with 50 real concurrent uploads (1,000 pages): **323.4
+   MB peak**, still under the 500 MB budget with room to spare (README).
 
 **Scale-out path**
 
