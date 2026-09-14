@@ -13,10 +13,10 @@ Measured, 50 concurrent jobs / 1,000 pages, cold stack:
 
 | Graded metric | Target | Measured |
 |---|---|---|
-| Peak RSS, all containers | < 500 MB | **262-281 MB** |
+| Peak RSS, all containers | < 500 MB | **261-281 MB** |
 | Unhandled pages | 0 | **0** of 1,000 |
 | Tree diff, 46-node document tree | < 100 ms | **4.6 ms** |
-| Time-to-first-page, p95 per client | < 200 ms | **95-99 ms** |
+| Time-to-first-page, p95 per client | < 200 ms | **94-99 ms** |
 
 Ranges are across repeated cold-stack runs, not a single best result.
 

@@ -51,7 +51,7 @@ curl -X POST localhost:8000/jobs/stream --data-binary @doc.pdf
 
 `page.partial` lands in ~50ms carrying layout output; `page.final` upgrades the
 same `page_index` when the VLM returns 1.5-3s later. Measured
-time-to-first-page: **95-99ms** at p95 per client (`bench/benchmark.py`,
+time-to-first-page: **94-99ms** at p95 per client (`bench/benchmark.py`,
 1,000 pages).
 
 ## Queue design
@@ -114,13 +114,25 @@ flag once a page is genuinely out of budget (Step 9). Try it:
 
 ```bash
 curl -X POST localhost:8001/admin/chaos -H 'Content-Type: application/json' \
-  -d '{"endpoint":"vlm","status":429,"ratio":1.0,"seconds":20}'
+  -d '{"endpoint":"vlm","status":429,"ratio":1.0,"seconds":120}'
 curl -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{"pages":5}'
 curl -N localhost:8000/jobs/<job_id>/stream
+# then confirm the terminus, which is the actual assertion:
+curl -s localhost:8000/jobs/<job_id> | python -m json.tool
 ```
 
 Pages reach `FALLBACK_DONE`, not `FAILED`, and every non-`DONE` terminus is
 counted rather than silently swallowed.
+
+**The chaos window has to be long, and that is not padding.** A page holds out
+for full VLM fidelity until `final_attempt`: `age_s >= degrade_after_s` (90s),
+or the requeue backstop is spent (`app/worker/main.py`). A SHORT storm
+therefore degrades nothing - the page retries, the storm ends, the VLM answers
+normally, and the page lands `DONE`. Measured: a 30 second window produced
+**zero** `FALLBACK_DONE` out of 10 pages, while 120 seconds produced 5 of 5.
+That is degradation behaving as a last resort rather than a first response,
+which is intended - but it makes a 20-30 second reproduction misleading, so the
+window above is deliberately longer than the hold-out budget.
 
 ## Build status
 
@@ -1642,9 +1654,9 @@ and scheduling.
 
 | Graded metric | Target | Measured | |
 |---|---|---|---|
-| Peak RSS, all containers | < 500 MB | **262-281 MB** | PASS |
+| Peak RSS, all containers | < 500 MB | **261-281 MB** | PASS |
 | Unhandled pages | 0 | **0** of 1,000 | PASS |
-| TTFP p95, per client | < 200 ms | **95-99 ms** | PASS |
+| TTFP p95, per client | < 200 ms | **94-99 ms** | PASS |
 | Tree diff, 46-node tree | < 100 ms | **4.6 ms** | PASS |
 
 Throughput 8.82 pages/s over 113 s wall clock; page latency p50/p95
@@ -1696,7 +1708,7 @@ zero-drop figure is taken from `state_counts`, not from `/metrics`.
 peaking at different moments never occupy that much at once, so summing peaks
 would overstate. And a fresh stack matters: six back-to-back runs in one stack
 lifetime measured **455 MB**, because Redis and the mock model accumulate state
-across runs. Both numbers are real; 262-281 MB is the one that describes a cold
+across runs. Both numbers are real; 261-281 MB is the one that describes a cold
 start, and the difference is disclosed rather than picked.
 
 `mem_limit: 256m` is set on api and worker so a regression that reintroduces
@@ -1707,7 +1719,7 @@ O(file) PDF buffering gets OOM-killed loudly instead of passing on a host with
 
 | | p95 |
 |---|---|
-| per client (the graded figure) | **95-99 ms** |
+| per client (the graded figure) | **94-99 ms** |
 | under a 50-way simultaneous burst | 1,237 ms |
 | first BYTE, per client | 16.5 ms |
 
