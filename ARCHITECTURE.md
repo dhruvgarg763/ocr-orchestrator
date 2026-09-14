@@ -13,10 +13,12 @@ Measured, 50 concurrent jobs / 1,000 pages, cold stack:
 
 | Graded metric | Target | Measured |
 |---|---|---|
-| Peak RSS, all containers | < 500 MB | **262.1 MB** |
+| Peak RSS, all containers | < 500 MB | **262-281 MB** |
 | Unhandled pages | 0 | **0** of 1,000 |
 | Tree diff, 46-node document tree | < 100 ms | **4.6 ms** |
-| Time-to-first-page, p95 per client | < 200 ms | **95.2 ms** |
+| Time-to-first-page, p95 per client | < 200 ms | **95-99 ms** |
+
+Ranges are across repeated cold-stack runs, not a single best result.
 
 Full measurement record: [README.md](README.md).
 
@@ -95,10 +97,11 @@ Layout failure has nothing to degrade to, so it is the one case that goes
 `FAILED`.
 
 **Zero drop, defined:** every page reaches a recorded terminal state, and
-every non-success terminus is counted. Graded run: 999 succeeded, 1 `FAILED`
-(layout exhausted retries against the mock's 2% failure rate) — visible in
-`state_counts` and `orch_pages_terminal_total{result="failed"}`. A silently
-vanished page is a drop; a counted failure is not. A `503` at the edge is the
+every non-success terminus is counted. Terminal failures are run-dependent
+(the mock fails 2% of layout calls): runs land at 0-1 `FAILED` of 1,000, and
+when one occurs it is layout exhausting its retries — visible in `state_counts`
+and `orch_pages_terminal_total{result="failed"}`, never silent. A vanished page
+is a drop; a counted failure is not. A `503` at the edge is the
 same standard applied at admission.
 
 **Memory boundaries:**
@@ -180,7 +183,13 @@ costs 2, not 1.
   directly fixes trade-off 2.
 - **Workers** — already horizontal (bucket/breaker/AIMD state is in Redis, so
   replicas don't multiply the downstream rate). Next: separate pools per
-  endpoint so layout capacity stops sharing a budget with VLM slots.
+  endpoint so layout capacity stops sharing a budget with VLM slots. The
+  replica count is not arbitrary: each worker's 16 slots are shared by both
+  stages (4 reserved for the priority lane), and by Little's Law the VLM's
+  10 rps at ~2.25 s latency needs ~22.5 pages in flight to saturate. Measured
+  VLM capacity reached: **1 replica 37%, 2 replicas 63%, 3 replicas 95%** —
+  below three, worker concurrency rather than the rate limiter is the binding
+  constraint, which is the same argument for the per-endpoint pools.
 - **Redis** — Sentinel/managed replica set removes the SPOF with no code
   change. Cluster is a bigger lift: the multi-key Lua scripts need
   hash-tagging by job id to be slot-safe.

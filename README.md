@@ -51,7 +51,7 @@ curl -X POST localhost:8000/jobs/stream --data-binary @doc.pdf
 
 `page.partial` lands in ~50ms carrying layout output; `page.final` upgrades the
 same `page_index` when the VLM returns 1.5-3s later. Measured
-time-to-first-page: **95.2ms** at p95 per client (`bench/benchmark.py`,
+time-to-first-page: **95-99ms** at p95 per client (`bench/benchmark.py`,
 1,000 pages).
 
 ## Queue design
@@ -1642,9 +1642,9 @@ and scheduling.
 
 | Graded metric | Target | Measured | |
 |---|---|---|---|
-| Peak RSS, all containers | < 500 MB | **262.1 MB** | PASS |
+| Peak RSS, all containers | < 500 MB | **262-281 MB** | PASS |
 | Unhandled pages | 0 | **0** of 1,000 | PASS |
-| TTFP p95, per client | < 200 ms | **95.2 ms** | PASS |
+| TTFP p95, per client | < 200 ms | **95-99 ms** | PASS |
 | Tree diff, 46-node tree | < 100 ms | **4.6 ms** | PASS |
 
 Throughput 8.82 pages/s over 113 s wall clock; page latency p50/p95
@@ -1662,8 +1662,11 @@ itself proves nothing:
 
 Two things in that block are stated rather than smoothed.
 
-**One page out of 1,000 ended FAILED**, and it should be read as the system
-working. Page 14 of one job hit an `HTTPStatusError` from the layout endpoint's
+**Terminal failures are run-dependent: 0-1 of 1,000.** The mock fails 2% of
+layout calls, so whether any page exhausts its layout retries is a matter of
+dice - a later run of the identical commit recorded 0 FAILED. When one does
+occur it should be read as the system working. In the run below, page 14 of one
+job hit an `HTTPStatusError` from the layout endpoint's
 2% failure rate and exhausted its retries; layout failure is the one genuinely
 unrecoverable case, because there is no lower fidelity to degrade to - a VLM
 failure degrades to layout-only output, but a layout failure has nothing
@@ -1693,7 +1696,7 @@ zero-drop figure is taken from `state_counts`, not from `/metrics`.
 peaking at different moments never occupy that much at once, so summing peaks
 would overstate. And a fresh stack matters: six back-to-back runs in one stack
 lifetime measured **455 MB**, because Redis and the mock model accumulate state
-across runs. Both numbers are real; 262.1 MB is the one that describes a cold
+across runs. Both numbers are real; 262-281 MB is the one that describes a cold
 start, and the difference is disclosed rather than picked.
 
 `mem_limit: 256m` is set on api and worker so a regression that reintroduces
@@ -1704,7 +1707,7 @@ O(file) PDF buffering gets OOM-killed loudly instead of passing on a host with
 
 | | p95 |
 |---|---|
-| per client (the graded figure) | **95.2 ms** |
+| per client (the graded figure) | **95-99 ms** |
 | under a 50-way simultaneous burst | 1,237 ms |
 | first BYTE, per client | 16.5 ms |
 

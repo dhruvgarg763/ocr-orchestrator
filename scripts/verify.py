@@ -991,51 +991,54 @@ async def verify_reaper(client: httpx.AsyncClient) -> None:
         # do.
         probe = await client.post(f"{API}/jobs", json={"pages": 3})
         probe_id = probe.json()["job_id"]
-        entry_id = await redis.xadd(
+
+        # Put a page in a dead consumer's pending list, deterministically.
+        #
+        # The creation and the claim MUST be one atomic server-side step, and
+        # getting this wrong twice is what makes it worth explaining.
+        #
+        # Attempt 1 - XREADGROUP as "ghost-worker" - loses a race it cannot
+        # win: three live workers sit blocked on this stream, so one takes the
+        # entry within microseconds of the XADD and the ghost reads nothing.
+        # Measured: 0 entries every time.
+        #
+        # Attempt 2 - XADD, then XCLAIM FORCE, asserting on XCLAIM's own
+        # JUSTID return so there was no second round trip to race. It still
+        # failed intermittently (once in three live runs), because the race was
+        # never about the PEL. `PageQueue.ack()` is XACK *plus XDEL*: when a
+        # live worker finishes the probe page it DELETES the stream entry. And
+        # XCLAIM FORCE on an id that no longer exists in the stream cannot
+        # create a PEL entry for it - it is a no-op returning empty. The
+        # sequence was:
+        #
+        #     XADD -> (worker reads, completes, XACK+XDEL) -> XCLAIM FORCE -> []
+        #
+        # So the assertion was racing the entry's EXISTENCE, not its ownership,
+        # and moving the assertion earlier could not fix that.
+        #
+        # A Lua script fixes it properly. Redis runs it atomically, so no
+        # worker's XREADGROUP can interleave between the XADD and the XCLAIM.
+        # Once the entry sits in ghost-worker's PEL it is no longer deliverable
+        # by `XREADGROUP >` at all - `>` returns only entries never delivered
+        # to the group - so the only route back to a live worker is the
+        # reaper's XAUTOCLAIM, which is exactly the mechanism under test.
+        # IDLE backdates the entry in the same step, replacing a 30s sleep.
+        now_ms = int(time.time() * 1000)
+        ghost_ids = await redis.eval(
+            """
+            local id = redis.call('XADD', KEYS[1], '*',
+                'job_id', ARGV[1], 'page_index', ARGV[2],
+                'enqueued_at_ms', ARGV[3], 'first_enqueued_at_ms', ARGV[3],
+                'trace_id', 'verify-reaper')
+            return redis.call('XCLAIM', KEYS[1], ARGV[4], 'ghost-worker', 0,
+                id, 'IDLE', 120000, 'JUSTID', 'FORCE')
+            """,
+            1,
             "stream:pages",
-            {
-                "job_id": probe_id,
-                "page_index": 1,
-                "enqueued_at_ms": int(time.time() * 1000),
-                "first_enqueued_at_ms": int(time.time() * 1000),
-                "trace_id": "verify-reaper",
-            },
-        )
-        # Put it in a dead consumer's pending list, deterministically.
-        #
-        # The obvious way - XREADGROUP as "ghost-worker" - loses a race it
-        # cannot win: three live workers sit blocked on the same stream, so one
-        # of them takes the entry within microseconds of the XADD and the ghost
-        # reads nothing. Measured: 0 entries every time.
-        #
-        # XCLAIM FORCE creates the PEL entry for a known id whether or not it
-        # was ever delivered, so the exact entry from the XADD above ends up
-        # owned by a name no process will ever answer for. IDLE backdates it in
-        # the same call, which is what replaces a 30 second sleep.
-        #
-        # The claim is asserted on XCLAIM's OWN return value, not on a follow-up
-        # XPENDING read. That is not a style preference - the XPENDING version
-        # was flaky and failed a live run. One of the three workers takes the
-        # entry microseconds after the XADD (see above), and when it finishes
-        # the stage it calls XACK, which removes the PEL entry no matter who
-        # currently owns it. So the sequence
-        #
-        #     XCLAIM FORCE -> (live worker XACKs) -> XPENDING
-        #
-        # legitimately observes zero ghost entries. The assertion was racing
-        # the very worker whose liveness the rest of this section depends on.
-        # JUSTID makes XCLAIM return the ids it actually claimed, so a
-        # non-empty return proves the orphaned-PEL state existed at that
-        # instant, in one atomic call with nothing to race.
-        ghost_ids = await redis.xclaim(
-            "stream:pages",
+            probe_id,
+            "1",
+            str(now_ms),
             "workers",
-            "ghost-worker",
-            min_idle_time=0,
-            message_ids=[entry_id],
-            idle=120_000,
-            justid=True,
-            force=True,
         )
         check(
             "an entry can be left pending under a name no process owns",
@@ -1051,19 +1054,18 @@ async def verify_reaper(client: httpx.AsyncClient) -> None:
             # the round trip that would observe it. It failed with
             # "orphaned=0" precisely because the mechanism worked too well.
             #
-            # The two halves are asserted separately instead, and neither is
-            # racy: the check above proves the entry really was pending under a
-            # name no process owns (straight from XCLAIM's return), and the check
-            # below proves it went to zero. A count sampled somewhere between
-            # them adds flakiness and no information.
+            # The two halves are asserted separately instead: the check above
+            # proves the entry really was pending under a name no process owns
+            # (returned by the atomic script itself), and the check below
+            # proves it went to zero. A count sampled somewhere between them
+            # adds flakiness and no information.
             #
-            # Zero can be reached two ways - the reaper reclaims the entry, or
-            # the live worker that was mid-stage on it calls XACK. This check
-            # deliberately does not distinguish them, because the invariant
-            # being defended is "no entry stays pending under a name no process
-            # owns", and both paths satisfy it. The reaper specifically is
-            # proven by the SIGKILL checks earlier in this section, where there
-            # is no live owner left to do the acking.
+            # Because the claim is atomic with the XADD, the entry was never
+            # deliverable by `XREADGROUP >` - so unlike the two earlier
+            # versions of this check, no live worker can settle it and the ONLY
+            # route to zero is the reaper's XAUTOCLAIM. That makes the
+            # assertion below a test of the reaper specifically, rather than of
+            # "something eventually cleaned this up".
 
             # The reaper scans every reaper_interval_s on every replica.
             deadline = time.monotonic() + 60
