@@ -1,67 +1,18 @@
 """Page task queue, on a Redis Stream with a consumer group.
 
-Why a stream and not a list
----------------------------
-`BRPOP` removes an item the instant a worker receives it. A SIGKILL one
-millisecond later loses the task with no record that it ever existed, which
-makes Module D's crash recovery impossible.
-
-`XREADGROUP` instead delivers the entry *and* records it in that consumer's
-Pending Entries List. Between delivery and `XACK` Redis knows the entry was
-handed to a specific consumer and not confirmed, so a dead worker's work is
-visible (`XPENDING`) and reclaimable (`XAUTOCLAIM`, Step 14).
-
-The obligation
---------------
-That gives at-least-once delivery, which means a task CAN arrive twice - a
-worker that finishes a page and dies before `XACK` will see it redelivered.
-Exactly-once is not achievable over a network, so the deal is: accept
-at-least-once, make processing idempotent. That is what the atomic state CAS
-(app/queue/state.py) and the `Idempotency-Key` header (app/worker/client.py)
-are for. Together they make redelivery harmless rather than corrupting.
-
-Two streams: why a job's FIRST page jumps the queue
----------------------------------------------------
-Time-to-first-page is graded, and under a single FIFO stream it is arithmetic
-that the metric cannot be met. Measured, 50 concurrent jobs of 20 pages:
-
-    p95 time-to-first-page   14,511 ms   (target: 200 ms)
-
-Not a tuning problem. 1,000 pages of layout at the endpoint's 100 rps is a 10
-second floor, and in FIFO order the 50th job's FIRST page sits at queue
-position ~980 - so it is layout-ed last, behind 979 pages belonging to clients
-who are already being served. Every job waits for every earlier job's ENTIRE
-document before seeing anything.
-
-So page 0 of each job goes to a separate `stream:pages:lead`, which workers
-drain preferentially. 50 lead tasks clear inside the layout endpoint's burst,
-every client gets a page event almost immediately, and the remaining pages fill
-in behind. Nothing is starved: the main stream is read in the same call.
-
-Two properties keep the lead stream tiny, which is what makes it fast:
-
-  * only page 0 goes there. The metric needs ONE page per job, not all of them.
-  * requeues and stage handoffs go to the MAIN stream. A page that has already
-    been delivered once is no longer first-page-critical, and routing retries
-    into the priority lane would let a saturated endpoint fill it with work
-    that cannot run.
-
-Redis Streams have no priority within a stream - they are strictly ordered by
-id - so a second stream is the mechanism, not a workaround.
-
-Memory
-------
-The task stream deliberately has NO MAXLEN. Trimming by length discards the
-*oldest* entries, and the oldest entries in a task queue are unprocessed work -
-a memory bound that eats your jobs. Entries are instead `XDEL`ed once
-acknowledged, which is safe because a consumer group delivers any given entry to
-exactly one consumer.
-
-Result streams get the opposite treatment - a MAXLEN - because their entries
-notify about state that is already durably committed to the page hash, so the
-oldest one is a disposable cache entry rather than unprocessed work. Same
-primitive, opposite trimming policy, because the data means different things.
-See app/queue/results.py.
+`XREADGROUP` (not `BRPOP`) records delivery in the consumer's Pending
+Entries List, so a worker SIGKILLed mid-page leaves recoverable evidence
+rather than losing the task silently - at the cost of at-least-once
+delivery, which the state CAS (app/queue/state.py) and Idempotency-Key
+(app/worker/client.py) make safe to redeliver. Page 0 of every job goes to
+a separate `stream:pages:lead`, drained preferentially, because under one
+FIFO stream the 50th job's first page sat at queue position ~980 (p95 TTFP
+14.5s against a 200ms target) - requeues and stage handoffs stay on the
+main stream since a page already delivered once is no longer
+first-page-critical. The task stream has no `MAXLEN` (trimming would
+discard unprocessed work); result streams do (app/queue/results.py),
+because their entries are disposable notifications about state already
+committed elsewhere.
 """
 
 from __future__ import annotations

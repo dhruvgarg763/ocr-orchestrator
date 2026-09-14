@@ -1,13 +1,11 @@
 """On-demand fault injection.
 
-The orchestrator's backpressure, retry and circuit-breaker paths are only
-interesting under duress, and duress that arrives 2% of the time at random is
-untestable. Chaos rules let a test say "make the VLM return 429 for 80% of
-requests for the next 30 seconds" and then assert that zero pages were dropped.
-
-Rules are time-boxed on purpose: a test that crashes half way through must not
-leave the mock permanently broken for every test that follows. Expiry is lazy,
-checked on read, so there is no background reaper task to supervise.
+Duress that arrives 2% of the time at random is untestable, so a chaos
+rule lets a test force e.g. "80% of VLM calls return 429 for 30 seconds"
+and assert zero pages were dropped. Rules are time-boxed so a test that
+crashes mid-run can't leave the mock permanently broken for every test
+after it; expiry is checked lazily on read rather than by a background
+reaper task.
 """
 
 from __future__ import annotations

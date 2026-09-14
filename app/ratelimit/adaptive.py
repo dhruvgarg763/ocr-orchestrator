@@ -1,74 +1,17 @@
 """AIMD rate controller: discover the rate actually available.
 
-Why this exists on top of a token bucket
-----------------------------------------
-The bucket enforces the rate we were TOLD. If the endpoint is degraded and can
-really only serve 4 rps, the bucket faithfully keeps sending 10 and six of them
-are destroyed every second - and it never learns, because it has no feedback
-loop. Worse, the assignment names a case the bucket cannot see at all: a
-latency spike with no 429s. Requests are accepted, p95 climbs 2s -> 15s, and
-nothing in Steps 7-9 notices while in-flight work piles up.
-
-AIMD is that feedback loop. Additive Increase, Multiplicative Decrease - TCP
-congestion control applied to a dispatcher.
-
-Why the asymmetry
------------------
-The costs of the two errors are wildly different:
-
-  rate too HIGH  congestion collapse. We are destroying pages and hurting the
-                 endpoint, so we must leave fast: x0.7 reaches safety in
-                 O(log) steps.
-  rate too LOW   merely slower than optimal. We can afford to explore gently:
-                 +1 probes in O(n) steps.
-
-The alternatives fail concretely:
-
-  both multiplicative (x0.7 down, x2 up)
-      Overshoots on every probe: 1,2,4,8,16 blows past a true limit of 10,
-      collapses, repeats. A large-amplitude sawtooth that spends half its life
-      in overload.
-  both additive (-1 down, +1 up)
-      If capacity drops from 10 to 1, nine steps of -1 are needed to reach
-      safety, destroying pages the whole way down.
-
-Additive increase is what keeps the sawtooth's amplitude small and centred just
-below true capacity. (Chiu & Jain 1989 also proved AIMD is the only linear
-control that converges to both fairness and efficiency when several flows share
-a bottleneck - here, several worker replicas sharing one VLM.)
-
-One-sided, unlike TCP
----------------------
-Textbook TCP has no ceiling because available bandwidth is unknown. We know the
-published limit, and probing above it would only earn 429s. So `max_rate` is
-the advertised rate: this controller only ratchets DOWN from what we were
-promised and recovers back up to it. It is not discovering unknown capacity, it
-is detecting when real capacity has fallen below the advertised figure.
-
-Which signals count as congestion - and which must not
-------------------------------------------------------
-Only LOAD signals: 429, timeout, and a p95 latency breach.
-
-5xx is deliberately excluded, and that is not an oversight. The mock has a 5%
-baseline failure rate that has nothing to do with load. Treating those as
-congestion would mean roughly one decrease per 20 requests - about as often as
-`increase_after` grants an increase - so the rate would be dragged permanently
-below the achievable one by noise the endpoint was always going to emit.
-Sustained 5xx is the circuit breaker's job; this controller answers a different
-question, "how fast may I go", not "is it alive".
-
-The refractory period
----------------------
-Without it, one congestion event collapses the rate to the floor. When the rate
-is cut there are already ~rate x latency requests in flight that were admitted
-at the OLD rate; they are about to hit the same overloaded endpoint and fail
-too. Letting each of those failures trigger its own multiplicative decrease
-gives 0.7^22 = 0.0004 of the original rate from a single event.
-
-TCP solves the identical problem with "one reduction per RTT" - the window
-halves once per loss EVENT, not once per lost packet. Same reasoning here: a
-reduction should not be re-applied until there has been time to observe its
-effect.
+The token bucket enforces the rate we were told; this discovers the rate
+actually available when an endpoint degrades - including a latency spike
+with no 429s at all, which the bucket cannot see. Asymmetric by design
+(TCP congestion control applied to a dispatcher): multiplicative decrease
+(x0.7) reaches safety in O(log) steps because overload is costly, additive
+increase (+1) probes gently because being merely slow is cheap. Only LOAD
+signals (429, timeout, p95 breach) count as congestion - 5xx is excluded
+because the mock's 5% baseline failure rate has nothing to do with load
+and would otherwise drag the rate down by noise; sustained 5xx is the
+circuit breaker's job. A refractory period after each decrease stops the
+~rate*latency requests already in flight at the old rate from each
+triggering their own cut.
 """
 
 from __future__ import annotations

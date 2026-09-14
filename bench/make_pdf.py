@@ -1,18 +1,10 @@
 """Generate a large, valid, multi-page PDF for the memory benchmark.
 
-Two properties matter, and the first attempt at this script got both wrong.
-
-Real per-page content, not blank pages: a blank 30-page PDF is 4 KB, which
-would make a memory measurement meaningless.
-
-UNCOMPRESSED, and random rather than repetitive: the first version used Flate
-with a single repeated line, and zlib crushed a nominal 100 MiB down to 0.3 MiB.
-Real scanned documents are dominated by incompressible image data, so an
-uncompressed stream of random text is the more faithful stand-in and gives a
-predictable target size.
-
-The PDF is assembled by hand so the xref offsets are exact and the size is
-controllable; pypdf's writer recompresses, which makes the size hard to target.
+Content is real per-page text (a blank PDF is too small to measure
+anything against) and UNCOMPRESSED random text, not repetitive - Flate on
+repeated content crushed a nominal 100 MiB down to 0.3 MiB in an earlier
+version. Assembled by hand rather than via pypdf's writer, so xref
+offsets and the output size are both exact and controllable.
 """
 
 from __future__ import annotations

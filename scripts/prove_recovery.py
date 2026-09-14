@@ -1,27 +1,15 @@
 """In-container half of the SIGKILL idempotency proof.
 
-Driven by scripts/prove_recovery.sh, which owns the `docker kill` because the
-Docker CLI is not available inside the api container. This half submits the
-work, watches it, and makes the assertions.
+Driven by scripts/prove_recovery.sh, which owns the `docker kill` (the
+Docker CLI isn't available inside the api container). Asserts the two
+claims Module D makes: every page reaches a terminal state with no
+`*_RUNNING` left behind, and the mock's per-key execution count shows
+zero duplicates - an exact count, not a heuristic, since it only
+increments on success.
 
-The two claims the spec asks for, stated precisely:
-
-  (a) "resume execution from the exact uncompleted page" - every page of every
-      job reaches a terminal state and `done_count == total_pages`, with no
-      page left in a *_RUNNING state and no queue entry left behind.
-
-  (b) "without re-running already completed pages or duplicating downstream
-      model calls" - the mock reports ZERO duplicate executions. That counter is
-      exact, not a heuristic: the mock increments a per-`Idempotency-Key`
-      execution count only after a call SUCCEEDS, so a key that failed once and
-      then succeeded still counts one. A count of two for any key therefore
-      means the same (job, page, stage) was genuinely computed twice.
-
-Usage:
-    python scripts/prove_recovery.py <phase> [args]
-
-      arm <jobs> <pages>   reset counters, submit, wait for work to be in flight
-      watch <deadline_s>   wait for every job to complete, then assert
+Usage: python scripts/prove_recovery.py <phase> [args]
+  arm <jobs> <pages>   reset counters, submit, wait for work to be in flight
+  watch <deadline_s>   wait for every job to complete, then assert
 """
 
 from __future__ import annotations

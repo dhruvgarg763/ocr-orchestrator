@@ -1,105 +1,15 @@
-"""Bounding-box IoU, and the matching problem hiding behind "mean IoU".
+"""Bounding-box IoU and box matching.
 
-The overlap arithmetic here is ten lines and textbook. Everything that needed
-thought is around it: one sign bug that produces plausible wrong answers, the
-fact that a single IoU number for a PAGE requires solving an assignment
-problem first, and two different denominators that both get called "mean IoU".
-
-1. The intersection, and the sign bug
--------------------------------------
-IoU is separable per axis:
-
-    overlap_w = max(0, min(x2a, x2b) - max(x1a, x1b))
-    overlap_h = max(0, min(y2a, y2b) - max(y1a, y1b))
-    inter     = overlap_w * overlap_h
-    union     = area_a + area_b - inter
-
-Two things that must not be got wrong. Union SUBTRACTS the intersection -
-adding the areas double-counts the shared region and deflates every
-overlapping pair. And `max(0, ...)` is load-bearing in a way that is easy to
-miss: for two boxes that are disjoint DIAGONALLY, both overlaps come out
-negative, and negative x negative is POSITIVE. Two 10x10 boxes offset
-diagonally by 20 get a phantom intersection of -10 x -10 = 100 against a union
-of 100 + 100 - 100 = 100, so the unclamped version reports IoU = 1.0 - a
-PERFECT overlap for boxes that do not touch. It only misbehaves when the boxes
-miss on BOTH axes; miss on one only and the product is negative, which is
-obvious. That asymmetry is why the bug survives casual testing, and
-`tests/test_iou.py` pins it against a deliberately unclamped implementation.
-
-2. Matching is a different problem from scoring
------------------------------------------------
-Given N predicted and M ground-truth boxes there is no "the" IoU - there are
-NxM pairwise values. Reporting one number requires first deciding which
-prediction corresponds to which ground truth, and that is an assignment
-problem, not a geometry question.
-
-`match_boxes` is greedy on descending IoU: score every pair, sort, and claim a
-pair whenever neither of its boxes is already taken. O(NM log NM).
-
-The optimal alternative maximises the SUM of matched IoUs (Hungarian, O(n^3)).
-Greedy is only a 1/2-approximation in general, so the interesting question is
-how much it actually loses on inputs that are REAL RECTANGLES rather than
-arbitrary matrices - because an IoU matrix from geometry is heavily
-constrained. 1 - IoU is a proper metric (Jaccard distance satisfies the
-triangle inequality), so the pathological matrices that defeat greedy may not
-be realisable by any set of boxes at all.
-
-Measured against a brute-force optimal matcher over random page layouts - see
-`tests/test_iou.py` and the README for the numbers - rather than assumed.
-
-Note on which greedy: COCO and PASCAL VOC do NOT order by IoU. They sort
-detections by CONFIDENCE descending and match each to its best available
-ground truth, which exists so a confidence threshold can be swept to draw a
-precision/recall curve. Our boxes do carry a `confidence` field, so this was a
-real choice: IoU-ordering is implemented because the question being asked here
-is "how well does this layout agree spatially", which is symmetric in the two
-box sets and has no threshold to sweep. Confidence-ordering is not implemented
-because nothing in this assignment asks for average precision or a PR curve,
-and it would be a second matching policy to defend for no credit. If AP is
-ever needed, that is the change - a different `order=` on this function, not a
-rewrite.
-
-3. Thresholding after matching is safe, and that is not obvious
----------------------------------------------------------------
-`match_boxes` pairs every box it can (any IoU > 0), and `score_boxes` applies
-the IoU>=0.5 threshold afterwards to classify true positives. The alternative -
-refusing to form a match below the threshold - sounds safer but gives exactly
-the same true-positive set, because greedy visits pairs in descending IoU, so
-every above-threshold pair is considered before any below-threshold one. A
-sub-threshold match can therefore only ever pair up boxes that were already
-left over.
-
-The reason to do it in this order is that it yields both numbers from one
-matching: a prediction that overlaps its ground truth at 0.49 contributes 0.49
-to spatial quality while still counting as a miss for detection. Refusing the
-match would throw that 0.49 away and report the box as though it had landed
-nowhere near. There is a test asserting the two orders agree on TP count.
-
-4. Two denominators, both called "mean IoU"
--------------------------------------------
-    mean_matched_iou   sum(matched IoU) / number of matches
-    mean_iou           sum(matched IoU) / number of ground-truth boxes
-
-The first is gameable in exactly the way `mean(per_page_cer)` was in
-app/eval/text.py: a model that emits one perfect box and misses ninety-nine
-scores 1.0. The second charges every missed ground truth as a zero. Both are
-exposed, `mean_iou` is the honest one, and `aggregate()` combines reports by
-summing numerators and denominators for the same reason `TextScore` does.
-
-Coordinate convention
----------------------
-(x, y, w, h) as the assignment specifies, with area = w*h and NO "+1". PASCAL
-VOC historically used w = x2 - x1 + 1, treating coordinates as inclusive pixel
-indices, which shifts every IoU slightly; COCO does not. Since the spec hands
-us w and h directly there is nothing to infer, but the convention is stated
-because a silent disagreement here is a classic source of metrics that almost
-match someone else's.
-
-`from_xyxy` exists as a named constructor for a specific reason: passing
-corner coordinates into a function expecting (x, y, w, h) is undetectable
-per-box when the corners happen to be positive, and produces systematically
-oversized boxes rather than an error. A named alternative is cheaper than
-remembering.
+Per-axis overlap with `max(0, ...)` clamping on each axis before
+multiplying - unclamped, two diagonally-disjoint boxes report a phantom
+IoU of 1.0 (negative x negative), pinned in tests/test_iou.py. Matching N
+predicted against M ground-truth boxes is greedy on descending IoU
+(O(NM log NM)); optimality vs. Hungarian (O(n^3)) is measured against a
+brute-force oracle, not assumed. `mean_iou` divides by ground-truth count,
+not match count, so a missed box counts as zero rather than being invisible
+to the average - `mean_matched_iou` is exposed too but is gameable the same
+way a per-page mean is. Coordinates are (x, y, w, h) with no "+1" (COCO
+convention, not PASCAL VOC's inclusive-pixel one).
 """
 
 from __future__ import annotations

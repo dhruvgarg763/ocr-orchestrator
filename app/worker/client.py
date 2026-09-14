@@ -1,32 +1,16 @@
 """HTTP client for the mock inference endpoints.
 
-Rate limiting is enforced HERE rather than in the pipeline, deliberately: one
-choke point that every call must pass through cannot be forgotten at a new call
-site. A limiter applied by the caller is a limiter someone eventually skips.
-
-Four gates guard every call, and their ORDER is the important thing:
-
-  1. circuit breaker   is this endpoint answering at all? Cheapest check, so it
-                       runs first - an open circuit must not consume a
-                       rate-limit slot a healthy endpoint could have used.
-  2. AIMD setpoint     how fast may we go, given what we have observed? Supplies
-                       the rate; it does not enforce it.
-  3. token bucket      enforces that rate across every replica, reserving a slot
-                       and waiting rather than rejecting.
-  4. retries           bounded, classified, full-jitter backoff, honouring
-                       Retry-After.
-
-On the way back, the outcome is reported to both the breaker (is it alive?) and
-the controller (how fast may I go?) - deliberately different questions, which is
-why a 5xx counts for the first and not the second.
-
-Two things have been here from the start, because retrofitting them is invasive:
-
-  * `Idempotency-Key`, derived deterministically from (job, page, stage). At
-    least-once delivery guarantees a page will sometimes be sent twice; this is
-    what makes the second send free instead of a duplicate 3s inference.
-  * `traceparent`, so one trace id spans api -> worker -> mock. ContextVars do
-    not cross a process boundary; a header does.
+Rate limiting is enforced HERE, not in the pipeline, so it can't be
+forgotten at a new call site. Four gates in order: circuit breaker
+(cheapest check, so it runs first - an open circuit must not consume a
+rate-limit slot a healthy endpoint could have used), AIMD setpoint
+(supplies the rate, doesn't enforce it), token bucket (enforces it across
+every replica), retries (bounded, full-jitter, `Retry-After` aware). The
+outcome is reported to both the breaker and the AIMD controller as
+deliberately different questions - a 5xx counts for one and not the
+other. `Idempotency-Key` (derived from job/page/stage) and `traceparent`
+have both been here from the start rather than retrofitted, since
+ContextVars don't cross the process boundary to the mock.
 """
 
 from __future__ import annotations

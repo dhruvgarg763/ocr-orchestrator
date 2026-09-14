@@ -1,13 +1,11 @@
 """Structured JSON logging.
 
-Every log line is one JSON object on stdout, automatically carrying the current
-trace_id/span_id. Container stdout is the log transport (12-factor): Docker,
-Loki or CloudWatch collect it; the app never manages files or rotation.
-
-Logs from libraries (uvicorn, httpx) go through the stdlib `logging` module,
-not structlog. We bridge them with ProcessorFormatter so *every* line is JSON —
-a log pipeline that has to parse two different formats is a log pipeline that
-silently drops half your data.
+Every log line is one JSON object on stdout, carrying the current
+trace_id/span_id automatically; stdout is the log transport (12-factor),
+the app never manages files or rotation. Library logs (uvicorn, httpx) go
+through the stdlib `logging` module, bridged via `ProcessorFormatter` so
+every line is JSON - a pipeline parsing two different formats is one that
+silently drops half its data.
 """
 
 from __future__ import annotations

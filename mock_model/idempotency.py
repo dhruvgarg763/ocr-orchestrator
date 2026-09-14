@@ -1,34 +1,17 @@
 """Idempotency-Key response replay, and the evidence trail for Module D.
 
-Contract: if two requests arrive with the same `Idempotency-Key`, the model runs
-*once* and the second request is served the stored response. This is what real
-inference APIs do, and it is what makes at-least-once queue delivery safe - the
-orchestrator can redeliver a page after a SIGKILL without paying twice for a 3s
-VLM call.
-
-It also produces the proof. Module D requires showing that a crash caused no
-duplicated downstream model calls, and "trust me" is not a proof. We count
-executions per key, so the assertion becomes mechanical: after killing a worker
-mid-job, `duplicate_executions` must be empty.
-
-Caching completed responses is NOT sufficient on its own. Checking the cache and
-populating it are separated by the model's own latency - up to 3 seconds for the
-VLM - and every request arriving inside that window misses:
-
-    req1..req5:  get(key) -> MISS   (nobody has finished yet)
-                 ... all five run the model ...
-                 all five write the cache
-
-That is a check-then-act race, and it is the exact scenario Module D creates: a
-worker is SIGKILLed mid-call, the page is redelivered, and the replacement
-request overlaps the original still-running one. So we also track work that is
-*in flight*: the first request for a key becomes the leader and executes;
-concurrent requests become followers that await the leader's result. This is the
-single-flight / request-coalescing pattern.
-
-Memory: the cache is bounded by BOTH entry count and TTL. An unbounded dict
-keyed by request id is the textbook server-side memory leak, and this assignment
-grades peak RSS - so even the test double has to get this right.
+Same key, model runs once - the second request gets the stored response,
+which is what makes at-least-once queue delivery safe to redeliver
+without paying twice for a 3s VLM call. Execution counts per key turn "no
+duplicated model calls" from a claim into a mechanical assertion
+(`duplicate_executions` must be empty after a SIGKILL test). Caching
+completed responses alone is not sufficient: checking and populating the
+cache are separated by up to 3 seconds of model latency, so concurrent
+requests inside that window all miss and all run the model. The first
+request for a key becomes the leader and executes; concurrent requests
+become followers awaiting the leader's result (single-flight /
+request-coalescing). The cache is bounded by both entry count and TTL,
+since this assignment grades peak RSS.
 """
 
 from __future__ import annotations

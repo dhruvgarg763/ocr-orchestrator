@@ -1,33 +1,15 @@
 """Page state machine, persisted in Redis.
 
-Why Redis and not a dict
-------------------------
-Module D requires resuming from the exact uncompleted page after a SIGKILL. A
-Python dict dies with the process, and with N worker replicas each process would
-hold a different dict and no worker would know what the others finished.
-
-Why each stage commits separately
----------------------------------
-A page makes two model calls: layout (~50ms) then VLM (up to 3s). Committing
-only at the end means a crash during the VLM stage loses the layout result too
-and the retry re-runs both. Committing per stage makes every stage a checkpoint,
-so the most work a crash can destroy is one stage.
-
-Why transitions are a Lua script
---------------------------------
-    state = await r.hget(key, "state")        # both workers read PENDING
-    if state == "PENDING":
-        await r.hset(key, "state", "RUNNING") # both workers write
-
-Two workers interleave between the read and the write, both believe they own the
-page, and the page is processed twice. Redis executes commands single-threaded
-and runs a Lua script as one indivisible unit, so the compare-and-set below
-cannot be interleaved by any other client.
-
-Note the division of responsibility: Lua provides *atomicity*, Python holds the
-*policy*. The transition table stays here where it is readable, diffable and
-unit-testable; the script only enforces "apply this change if and only if the
-current state is one of these".
+A Python dict dies with the process and gives N worker replicas N
+different views of what's done - Redis is the one place all of them can
+agree, which is what Module D's SIGKILL-resume requirement needs. Each
+stage (layout, then VLM) commits SEPARATELY, so a crash mid-VLM loses
+only that stage's work, not the already-committed layout result.
+Transitions run as a Lua script rather than `HGET` then `HSET`, because
+two workers reading the same `PENDING` state and both writing `RUNNING`
+is a race a script closes - Redis runs it as one indivisible unit. The
+transition TABLE stays in Python, readable and unit-testable; Lua only
+enforces the compare-and-set.
 """
 
 from __future__ import annotations

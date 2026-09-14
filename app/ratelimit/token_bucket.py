@@ -1,68 +1,17 @@
 """Distributed token bucket, enforced inside Redis.
 
-Why not the in-process bucket from mock_model/ratelimit.py
-----------------------------------------------------------
-That one is correct for the mock, because the mock is a single server enforcing
-its own published limit - it is the sole authority. A *client-side* limiter
-cannot work that way. Each worker replica would hold its own bucket and each
-would faithfully enforce 10 rps, for an aggregate of N x 10. Measured:
-
-    1 replica  x 10 rps  ->   9 requests/sec   (correct)
-    3 replicas x 10 rps  ->  27 requests/sec   (3x violation)
-    5 replicas x 10 rps  ->  45 requests/sec   (4x violation)
-
-The error is proportional to how well you have scaled out, so the bug appears
-exactly when the system starts succeeding.
-
-Three things therefore have to be shared, not just one:
-
-  1. the token count  -> lives in a Redis hash
-  2. the read-modify-write -> a Lua script, which Redis runs atomically, so 24
-     concurrent claimants cannot all observe the same token and overdraw
-  3. the CLOCK -> taken inside the script via redis.call('TIME')
-
-Point 3 is the easy one to miss. If `now` were passed in as an argument, every
-container would supply its own clock. Measured with a client-supplied clock:
-
-  * A *constant* offset turns out to be survivable. The `elapsed > 0` guard
-    below means a lagging replica simply never refills, so the fastest clock
-    becomes the de-facto authority and the aggregate rate stays roughly right -
-    unfair, but not a violation.
-  * A clock *lead* is not survivable. A replica 3s ahead, arriving at a bucket
-    another replica had just drained, computed elapsed = +3000ms and was granted
-    10 requests immediately - the entire burst, minted from nothing.
-
-Real clocks do exactly that: NTP steps them forward, VMs resume from suspend,
-containers start on hosts with drifted clocks. Taking the time inside the script
-means there is exactly one clock and the whole class of bug disappears. (It
-makes the script non-deterministic, which mattered under Redis <= 4 command
-replication; Redis 5+ uses effects replication, so it is safe.)
-
-Reservation, not polling
-------------------------
-The script does not merely report how long to wait - it hands out a slot. When
-no token is free it deducts the cost anyway, driving the balance NEGATIVE, and
-returns the delay until that debt is paid off. The caller sleeps once and
-proceeds. The negative balance IS the queue, recorded in the bucket.
-
-The obvious alternative - return a wait and have the caller re-poll - collapses
-at scale, because every waiter computes the same delay, wakes in the same
-instant, and all but `rate` of them are denied again. Measured on a 10 rps
-bucket:
-
-    waiters   grants   Redis calls   wasted
-         16       16            35      54%
-         48       48           751      94%
-        150      150         9,063      98%
-        400      310        61,692      99%
-
-199 round trips per granted token at 400 waiters. With reservation it is 1, and
-grants follow arrival order rather than being re-raffled every tick. This is
-what Guava's RateLimiter.acquire() does, and it is still a token bucket - the
-balance simply carries a debt.
-
-The debt is bounded: a reservation is only issued if it fits inside the caller's
-max_wait, so the balance cannot fall below -(max_wait * rate).
+A client-side bucket cannot work here: N worker replicas would each
+enforce the limit independently, for an aggregate of N x the intended
+rate (measured: 3 replicas x 10 rps -> 27 actual rps). So the token
+count, the read-modify-write, and the CLOCK are all shared in one atomic
+Lua script - the clock specifically must be taken inside the script via
+`TIME`, because a client-supplied clock that runs ahead can mint an
+entire burst from nothing (a replica 3s ahead sees elapsed=+3000ms and is
+granted the whole bucket at once). The script reserves rather than polls:
+an unavailable token drives the balance negative and returns the wait to
+pay it off, instead of every waiter re-polling and colliding (measured:
+400 waiters against a poll-based bucket cost 61,692 Redis calls for 310
+grants). The debt is bounded by the caller's max_wait.
 """
 
 from __future__ import annotations

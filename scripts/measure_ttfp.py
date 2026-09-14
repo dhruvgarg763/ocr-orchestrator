@@ -1,25 +1,13 @@
 """Measure time-to-first-page over the live SSE endpoint.
 
-Graded at 15%, so the number has to be measured the way a client experiences it
-rather than the way it is easiest to produce.
+Graded at 15%, measured the way a client experiences it. Two clocks are
+reported: "from POST" (end-to-end - admission, enqueue, handshake, the
+layout call, everything) and "from OPEN" (isolates the pipeline from the
+ingestion round trip). `stream.open` is NOT counted as a first page - it's
+a connection header emitted immediately, and timing to it would produce a
+flattering number that says nothing about whether a page was processed.
 
-Two clocks are reported, because they answer different questions:
-
-    from POST     the honest end-to-end figure. Starts when the client begins
-                  its ingestion request and ends when the first PAGE event
-                  lands. Includes the POST round trip, admission, enqueue, the
-                  client's own decision to connect, the stream handshake and
-                  the layout call - i.e. everything.
-    from OPEN     starts when the SSE request is issued. Isolates the pipeline
-                  from the ingestion round trip, which is what you want when
-                  deciding whether a regression is in the stream or upstream.
-
-`stream.open` is NOT counted as a first page. It is a connection header we emit
-immediately, so timing to it would produce a flattering number that says
-nothing about whether any page was processed.
-
-Usage:
-    python scripts/measure_ttfp.py [jobs] [pages] [concurrency]
+Usage: python scripts/measure_ttfp.py [jobs] [pages] [concurrency]
 """
 
 from __future__ import annotations

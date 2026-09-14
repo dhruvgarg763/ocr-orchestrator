@@ -1,80 +1,20 @@
 """Bounded PDF ingestion: O(page) resident memory, never O(file).
 
-The requirement is explicit: "PDF stream processing must handle page splitting
-on-the-fly without buffering entire 100MB PDF byte arrays in memory", against a
-500MB RSS budget under 50 concurrent ingestions. That is 20% of the grade, and
-the naive implementation fails it by an order of magnitude.
+Three decisions remove the O(file) term: uploads stream to disk in 1 MiB
+chunks (never a size-less `read()`), page count comes from the xref/page
+tree only (no content-stream parsing), and each page is opened, extracted
+and closed independently rather than pre-split - pypdf's object cache
+would otherwise accumulate across the whole document.
 
-What the naive version costs
-----------------------------
-    content = await file.read()               # 100 MB resident, right here
-    reader = PdfReader(io.BytesIO(content))   # + the parsed object graph
-    for page in reader.pages:
-        writer = PdfWriter(); writer.add_page(page)
-        buf = io.BytesIO(); writer.write(buf)
-        pages.append(buf.getvalue())          # + a second full copy
-
-O(file) x 2-3 resident. At 50 x 100 MB that is 5-15 GB against a 500 MB budget.
-
-Three independent decisions, each removing one O(file) term
------------------------------------------------------------
-  upload       1 MiB chunks straight to disk, never `read()` with no size.
-               Resident is the chunk, not the file.
-  page count   read the xref and the page tree only. A page COUNT does not
-               require parsing content streams, so this is O(objects) rather
-               than O(bytes).
-  extraction   open, take page n, close. One page's objects are resident and
-               are freed when the reader goes out of scope.
-
-The pypdf trap that makes or breaks all of this
------------------------------------------------
-`PdfReader` MUST be handed an open file object, never a path. Passing a path
-looks more idiomatic and is what every example in the documentation shows, but
-pypdf's `_initialize_stream` does this:
-
-    if isinstance(stream, (str, Path)):
-        with open(stream, "rb") as fh:
-            stream = BytesIO(fh.read())      # the ENTIRE file, resident
-
-Measured on a 100 MiB / 100-page document:
-
-    PdfReader(str(path))       +100.4 MiB   (the whole file)
-    PdfReader(open(path,'rb')) +  0.0 MiB   (seeks lazily)
-    + extract_text(one page)   +  5.5 MiB   (that page's content)
-
-The first version of this module used the path form, and because extraction is
-per-page it slurped 100 MiB a hundred times over. It measured WORSE than the
-naive read-everything implementation it was meant to replace: 420 MiB peak
-versus 301 MiB. One argument type is the difference.
-
-Why not pre-split at ingestion
-------------------------------
-Splitting all 100 pages up front means holding one reader open across all 100
-extractions, and pypdf caches every object it resolves (`resolved_objects`), so
-the cache accumulates the whole document - exactly the O(file) term we are
-trying to remove. It also costs 100x the disk.
-
-Lazy extraction instead re-reads the xref once per page. That is real CPU spent
-to buy bounded memory, and it is the right trade here for two reasons: memory is
-graded and CPU is not, and the pipeline is bottlenecked on a 10 rps VLM, so
-there is CPU to spare. The cost is measured rather than assumed - see
-tests/test_pdf_splitter.py.
-
-Why the queue carries a REFERENCE, not bytes
---------------------------------------------
-This is the decision that keeps Step 11 honest. Admission control bounds Redis
-by counting pages at ~300 bytes each; putting page bytes on the queue would make
-a 100-page 100 MB document cost 100 MB of Redis and collapse that arithmetic.
-So a task carries `job_id` and `page_index`, the worker resolves the file, and
-the queue entry's size is independent of the document's.
-
-Disclosed simplification
-------------------------
-The mock model is fed a page DESCRIPTOR - dimensions, rotation, a bounded text
-sample - not a rendered raster image. Rasterising would need a native renderer
-and the mock has no use for pixels. The production shape is the same memory
-profile: page bytes go to a blob store and a URI is passed instead, which is
-still O(1) on the queue and O(page) in the worker.
+`PdfReader` MUST receive an open file handle, not a path: passing a path
+makes pypdf read the entire file into memory internally
+(`_initialize_stream`), measured at +100.4 MiB on a 100 MiB file vs +0.0
+MiB for an open handle. The task queue carries a (job_id, page_index)
+reference, never page bytes, so a queue entry's size is independent of the
+document's - which is what keeps admission control's memory arithmetic
+honest. The mock receives a page descriptor (dimensions, a bounded text
+sample), not a rendered image; the production shape is a blob-store URI,
+same O(page) profile.
 """
 
 from __future__ import annotations

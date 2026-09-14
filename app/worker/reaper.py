@@ -1,52 +1,18 @@
 """Recover page tasks orphaned by a worker that will never come back.
 
-The last of four recovery layers, and the only one that covers a worker being
-REPLACED rather than restarted:
-
-  per-stage commits    a crash costs one stage, not the page. LAYOUT_DONE is
-                       durable and is a legal resume point, so a redelivered
-                       page never repeats a committed stage.
-  read_own_pending     a worker restarting under the same name (the container
-                       hostname) resumes its own interrupted work immediately,
-                       with no idle timeout to wait out.
-  THIS MODULE          a consumer that stopped renewing its leases. Its PEL
-                       entries are delivered - so `XREADGROUP >` skips them -
-                       and owned by nobody, so no live worker will ever ack
-                       them. The pages are non-terminal AND unreachable, which
-                       is the one state a zero-drop guarantee cannot survive.
-  Idempotency-Key      a duplicate DELIVERY never becomes a duplicate model
-                       call, which is the price of at-least-once and the reason
-                       all of the above are safe to be aggressive.
-
-Requeue, do not dispatch
-------------------------
-The tempting shape is to claim the orphan and hand it straight to the dispatch
-loop. That introduces a bug which does not exist today, because XACK is
-GROUP-scoped rather than consumer-scoped: if worker A is alive but slow and
-still holds entry X, and B claims X in place, then A finishes, sees the page is
-not its own any more, and acks - XDELing the only queue entry for a page B is
-mid-flight on. Should B then die, the page is stranded, and the recovery
-mechanism would have manufactured the exact failure it exists to prevent.
-
-So the reaper never runs a page. It rolls the page back to its last committed
-checkpoint, publishes a FRESH entry, and acks the original. Nobody ever shares
-an entry id, and A's later ack is a no-op on an id that no longer exists. The
-fresh entry then travels the ordinary dispatch path - which is why this file
-needs no changes in the pipeline at all: a first delivery of a page sitting at
-PENDING or LAYOUT_DONE is already the normal resume path from Step 4.
-
-Charging the attempt
---------------------
-A reclaim DOES spend one of the page's attempts, unlike a stage handoff. The
-distinction is about what the evidence implicates. A handoff is the page's own
-success, and a saturation requeue is a property of the endpoint - charging
-either would degrade pages for something they did not do. But a worker dying
-while holding a specific page is weak evidence about THAT PAGE: the most likely
-innocent cause is an unrelated SIGKILL, and the most likely guilty one is that
-the page itself is what killed the worker. An uncounted reclaim would let a
-poison page cycle through every replica in turn, indefinitely. Counting it
-means such a page degrades to FALLBACK_DONE or FAILED and is reported, which is
-the honest outcome.
+The one recovery layer that covers a worker being REPLACED rather than
+restarted: a consumer that stopped renewing its leases leaves PEL entries
+delivered (so `XREADGROUP >` skips them) and owned by nobody, which is the
+one state a zero-drop guarantee cannot survive. Never dispatches a claimed
+orphan directly - `XACK` is group-scoped, so if the "dead" owner is
+actually alive-and-slow, its eventual ack would `XDEL` the only queue
+entry for a page this reaper is mid-flight on. Instead it rolls the page
+back to its last committed checkpoint, publishes a fresh entry, and acks
+the original, so nobody ever shares an entry id. A reclaim spends one
+attempt (unlike a stage handoff or a saturation requeue) because a worker
+dying while holding a specific page is weak evidence against that page,
+and an uncounted reclaim would let a poison page cycle through every
+replica forever.
 """
 
 from __future__ import annotations

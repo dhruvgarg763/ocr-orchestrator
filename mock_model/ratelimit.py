@@ -1,23 +1,12 @@
 """In-process token bucket for the mock inference server.
 
-Algorithm
----------
-A bucket holds up to `burst` tokens and refills at `rate` tokens/sec. Each
-request costs one token; if none is available the caller is told how long to
-wait. Refill is computed lazily from elapsed time rather than by a background
-timer: O(1) per call, no task to supervise, and exact rather than tick-quantised.
-
-Scope
------
-This limiter is deliberately *in-process*, which is correct here because the
-mock is a single server enforcing its own published limit - it is the one
-authority. The orchestrator's client-side limiter cannot work this way: with N
-worker replicas, N in-process buckets would permit N x the intended rate, so
-that one lives in Redis (see Step 7). The contrast is the point.
-
-Caveat: correctness assumes ONE process per bucket. Running uvicorn with
---workers 2 would give each worker its own bucket and double the real limit,
-which is why the mock runs single-worker.
+Refill is computed lazily from elapsed time, not a background timer:
+O(1) per call, exact rather than tick-quantised. Deliberately in-process,
+which is correct here because the mock is a single server enforcing its
+own published limit - the orchestrator's client-side limiter can't work
+this way (N replicas would give N x the intended rate; see
+app/ratelimit/token_bucket.py). Correctness assumes one process per
+bucket, which is why the mock runs single-worker.
 """
 
 from __future__ import annotations

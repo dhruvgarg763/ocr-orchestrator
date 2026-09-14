@@ -1,18 +1,11 @@
 """Trace context propagation.
 
-A trace id follows one unit of work (an HTTP request, or one page moving through
-the pipeline) across function calls, across `asyncio` tasks, and across process
-boundaries via the W3C `traceparent` header.
-
-Why ContextVar and not a global or threading.local():
-  - a global is shared by every concurrent task, so 16 pages would overwrite
-    each other's id;
-  - threading.local() keys off the OS thread, but every coroutine in an asyncio
-    program runs on the *same* thread, so they would all share one slot.
-
-ContextVar keys off the logical execution context. `asyncio.create_task()`
-copies the current context into the new task, so a child task inherits the
-trace id and its own writes stay isolated from siblings.
+`ContextVar`, not a global (shared by every concurrent task) or
+`threading.local()` (every asyncio coroutine runs on the same OS thread,
+so they'd all share one slot). `asyncio.create_task()` copies the current
+context into the new task, so a child task inherits the trace id while
+its own writes stay isolated from siblings. Crosses process boundaries
+via the W3C `traceparent` header.
 """
 
 from __future__ import annotations

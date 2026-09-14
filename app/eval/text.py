@@ -1,115 +1,14 @@
 """CER and WER: normalised edit distance over grapheme clusters and words.
 
-Character Error Rate and Word Error Rate are the same algorithm applied to two
-different tokenisations, so this module is one dynamic program and some very
-thin wrappers. Everything interesting is in three decisions: how much memory
-the DP uses, what a "character" is, and how per-page scores combine.
-
-1. Two rows, not a matrix
--------------------------
-    d[i][j] = min( d[i-1][j] + 1,                              # deletion
-                   d[i][j-1] + 1,                              # insertion
-                   d[i-1][j-1] + (ref[i-1] != hyp[j-1]) )      # sub / match
-
-Row `i` reads row `i-1` and itself. It never reads row `i-2`. So allocating the
-full (m+1)x(n+1) matrix means allocating memory that is written once and then
-never read again - and it is the only term in this function that grows
-quadratically.
-
-Measured with `tracemalloc`, a full list-of-lists matrix costs a steady
-36-39 bytes per cell - one int object plus its list slot:
-
-    n=1600   matrix  100.03 MB   two rows  0.131 MB    764x
-    n=5000   matrix     ~900 MB   two rows  ~0.36 MB  ~2500x
-
-The n=5000 row is projected from the measured per-cell cost, because
-materialising it to check would itself blow the budget - which is the point.
-A dense OCR page is a few thousand characters, so the matrix version needs more
-than this entire service's 500 MB RSS allowance for ONE `/evaluate` call. Time
-is O(mn) either way; two rows buy memory only, which is exactly the trade the
-budget wants.
-
-Two things that measurement taught, both of which had to be measured:
-
-  - An earlier draft of this docstring estimated ~200 MB for n=5000 by hand.
-    200 MB turns out to be the cost of the bare list slots with no int objects
-    at all; the real figure is ~900 MB. Guessing the constant factor of a
-    Python data structure is not worth doing.
-  - Below n=257 the numbers lie. CPython interns small ints, so every cell of a
-    short DP reuses a cached object and only the 8-byte slot is charged. A
-    naive 250-vs-500 doubling therefore appears to grow 8.9x rather than 2x.
-    `tests/test_text_metrics.py` measures at n=400 and n=800 for this reason.
-
-The shorter sequence is placed on the columns, making the bound O(min(m,n))
-rather than O(n) - safe here because the DISTANCE is symmetric.
-
-2. A "character" is not a Python code point
--------------------------------------------
-`len("क्षि") == 4`. Python strings iterate code points, and Devanagari (like
-every Indic script) builds a single written character from a base consonant, a
-virama, and vowel signs - each its own code point. Scoring CER over `str`
-directly therefore:
-
-  - penalises one misread conjunct up to 4x, while one misread Latin letter
-    costs 1x, so errors are not comparable across scripts; and
-  - inflates the denominator, so the same model looks better on Devanagari
-    than it is.
-
-`graphemes()` segments into user-perceived characters first, and `cer()`
-defaults to it. `unit="codepoint"` is kept because most published baselines and
-tooling (jiwer, torchmetrics) are code-point based, and you cannot compare
-against a number you cannot reproduce. See `tests/test_text_metrics.py` for the
-measured divergence on real Devanagari.
-
-3. Rates do not average
------------------------
-CER over a corpus is `sum(errors) / sum(lengths)`, NOT `mean(per_page_cer)`.
-The second weights a 5-character page the same as a 5,000-character one, and a
-single short page with a hallucinated line can move it arbitrarily. That is why
-the scoring functions return a `TextScore` carrying the numerator and
-denominator separately, and `aggregate()` is the only supported way to combine
-them. A bare float cannot be combined correctly, so `cer()`/`wer()` are
-conveniences for a single pair, not building blocks.
-
-Note also that CER is NOT bounded by 1.0: the denominator is the reference
-length, so 10 reference characters against 500 hallucinated ones is CER 50.
-Clamping it to 1.0 (or dividing by `max(len(ref), len(hyp))`) is a common
-"fix" that throws away the metric's most useful signal - runaway insertion
-should not look like an ordinary substitution.
-
-Deliberately not used: the Myers bit-parallel algorithm
--------------------------------------------------------
-Myers 1999 packs a DP column into machine words and computes the same distance
-in O(mn/w). Measured here on two 2,000-character sequences:
-
-    two-row DP      1097 ms
-    bit-parallel       7.5 ms      146x, identical distance
-
-That is a large, real speedup and it is not being taken. This codebase has to
-be explicable line by line, and a 146x speedup built from bitwise
-carry-propagation tricks is not something to defend under questioning when the
-two-row DP is already fast enough for the spec's own numbers - a dense page
-pair costs ~1.1 s of CPU either way, which just means an `/evaluate` handler
-belongs in a worker thread rather than on the event loop. Correctness that is
-obvious beats speed that has to be taken on faith.
-
-Affix stripping (dropping the common prefix and suffix before the DP) WAS
-measured as a cheaper mitigation and rejected: 1.2x on a realistic 2%-error
-page, 1.0x on a noisy one. Ten lines of special-cased index arithmetic for no
-reliable gain.
-
-Not built: a substitution/insertion/deletion breakdown
---------------------------------------------------------
-The assignment asks for "standard Levenshtein edit distance" - the rate, not
-its decomposition. An earlier version of this module carried an `edit_counts`
-DP variant that tallied S/I/D per pair; it was cut because nothing in this
-codebase consumed it; it is not part of the spec, the scoring table, or the
-qualitative criteria; and it is not free to defend - it is a second DP shape
-(4-int tuples instead of a bare int, ~2.5-3x the memory and ~2x the time of
-`levenshtein`, plus a decomposition-is-not-unique tie-breaking rule) that earns
-no credit anywhere. If a future consumer genuinely needs the breakdown, it is
-a small, self-contained addition on top of this file - not a reason to carry
-it now.
+Two-row DP (O(min(m,n)) space, not the full matrix - measured at ~900 MB
+for a full matrix vs ~0.36 MB for two rows at n=5000; see
+tests/test_text_metrics.py). Characters are Unicode grapheme clusters by
+default, not code points, so multi-codepoint scripts like Devanagari score
+correctly; `unit="codepoint"` is kept for comparison against code-point
+baselines (jiwer, torchmetrics). Rates aggregate as
+sum(errors)/sum(lengths), never mean(per-page rate) - see `aggregate()`.
+CER is intentionally not bounded to 1.0: it is errors over reference
+length, and clamping would hide runaway insertion.
 """
 
 from __future__ import annotations

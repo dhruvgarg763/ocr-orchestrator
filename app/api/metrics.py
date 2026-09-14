@@ -1,45 +1,17 @@
 """GET /metrics - Prometheus exposition, assembled from three sources.
 
-A scrape here is a fan-in, not a read of one counter table. The values come
-from wherever they already live, which is the point: nothing in this file is a
-second source of truth for a number some other module already owns.
-
-    Redis, written by the workers      retries, 429s, page outcomes, in-flight,
-                                       reaper actions, model latency histogram
-                                       (see common/metrics.py for why the
-                                       workers cannot be scraped directly)
-    Redis, native application state    queue backlog/pending per lane, breaker
-                                       state, adaptive limit, admission tallies
-    This process                       SSE subscribers, /evaluate timings
-
-Constraints a scrape endpoint has that an ordinary route does not
----------------------------------------------------------------
-It is hit every 15 seconds forever, by a client that will not stop, and a
-timeout on it looks like the service being down. So:
-
-  cheap        one pipelined round trip for the Redis-backed families, and no
-               key scans proportional to job or page count. `KEYS`/`SCAN` over
-               `job:*` would make scrape cost grow with retention - the
-               terminal-state counters are therefore incremented by the workers
-               on transition, never derived by counting hashes.
-
-  non-blocking everything here is awaited I/O or dictionary arithmetic. The
-               same argument as app/api/evaluate.py, for the same reason: this
-               process serves the SSE streams the TTFP metric is measured on.
-
-  best-effort  a scrape must not fail because one dependency is briefly
-               unavailable. A degraded scrape that reports what it can is worth
-               more than a 500, because the metrics are how you find out what
-               is wrong - and losing them exactly when something breaks is the
-               worst possible time.
-
-No transactional consistency across families, deliberately
-----------------------------------------------------------
-Queue depth is read microseconds apart from the page counters, so the two can
-disagree by a page or two. Making them consistent would mean holding a lock
-across the whole scrape, blocking the pipeline every 15 seconds to make a
-monitoring snapshot tidier than the thing it monitors. Prometheus is built for
-this - every scrape is a sample, and rates are computed across scrapes.
+Redis (written by workers: retries, 429s, page outcomes, in-flight, model
+latency - see common/metrics.py for why workers can't be scraped
+directly), Redis (native app state: queue depth, breaker, adaptive limit,
+admission), and this process (SSE subscribers, `/evaluate` timings) - a
+fan-in, not a second source of truth. A scrape is hit every ~15s forever,
+so it must stay cheap (one pipelined round trip, no `KEYS`/`SCAN`
+proportional to job count - terminal counters are incremented by workers
+on transition, never derived by counting hashes), non-blocking, and
+best-effort (a degraded scrape beats a 500, since metrics are how you find
+out what's wrong). No transactional consistency across families is
+enforced deliberately - Prometheus is built for independent per-scrape
+samples.
 """
 
 from __future__ import annotations

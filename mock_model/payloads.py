@@ -1,17 +1,11 @@
 """Deterministic synthetic model output.
 
-Determinism is a hard requirement, not a nicety:
-
-1. Idempotency proof (Module D). If a page is redelivered after a crash, the
-   replayed response must be byte-identical to the original, otherwise you
-   cannot tell "safely retried" from "silently produced different output".
-2. Evaluation (Module C). CER/WER/IoU/TED need a stable prediction to compare
-   against a stable ground truth. A random mock makes every metric noise.
-
-Seeding uses hashlib, NOT Python's built-in hash(). `hash()` on str is salted
-per process (PYTHONHASHSEED), so it returns different values after every
-restart - which would break determinism in exactly the crash-recovery scenario
-we need it for.
+Determinism is required, not a nicety: a redelivered page's replayed
+response must be byte-identical to the original (Module D's idempotency
+proof), and CER/WER/IoU/TED need a stable prediction against a stable
+ground truth (Module C - a random mock makes every metric noise). Seeding
+uses `hashlib`, not Python's `hash()`, which is salted per process
+(`PYTHONHASHSEED`) and would break determinism across a restart.
 """
 
 from __future__ import annotations

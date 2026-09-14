@@ -1,74 +1,20 @@
 """Admission control: the outermost memory bound.
 
-Why downstream backpressure is not enough
------------------------------------------
-Steps 7-10 all push back on the DOWNSTREAM side - token bucket, retries,
-breaker, AIMD - and every one of them protects the model endpoints. None of
-them protects this service from ingestion, because they all act after the work
-is already in the queue.
-
-The rate mismatch is enormous. A client can POST a 100-page job in about 5ms,
-so a single caller offers ~20,000 pages/sec of ARRIVAL against 10 pages/sec of
-SERVICE. When lambda > mu is sustained, queue length grows without bound; that
-is arithmetic, not a tuning problem, and no value of any knob in Steps 7-10
-changes it.
-
-Note where it grows. Our own RSS is already bounded by bounded dispatch (Step
-6): resident tasks are <= worker_concurrency however deep the queue gets. But
-each queued page costs a stream entry plus a state hash - MEASURED at ~300
-bytes per page - so Redis is the unbounded resource, and refusing at the edge
-is the only thing that can bound it. Offering 40,000 pages to a single slow
-worker:
-
-    watermark off (50,000)   39,998 queued   Redis +11.3 MiB   0 shed
-    watermark on  (5,000)     6,000 queued   Redis  +1.8 MiB   340 shed
-
-Nothing in the first row stops: the client can keep posting, and at ~300
-bytes/page a million queued pages is ~300MB of Redis with no natural limit.
-
-"Isn't a 503 a dropped job?"
----------------------------
-The graded metric is "0% UNHANDLED failed jobs". A 503 carrying Retry-After is
-handled: synchronous, explicit, counted, and machine-readable. Compare the
-alternative - accept the job, return 202, then OOM-kill the worker and lose
-every in-flight page. The client was told the work was accepted and it silently
-never happens. That is a dropped job.
-
-You cannot have both unbounded admission and bounded memory. The limit exists
-either way; the only choice is whether the refusal is explicit and early (a 503
-the client can act on) or implicit and late (an OOM kill nobody is told about).
-
-Which makes the real guarantee stronger, not weaker: not "we never say no", but
-ONCE ADMITTED, A PAGE IS NEVER DROPPED. Admission is the boundary; inside it,
-zero drop.
-
-Why XLEN is the signal
-----------------------
-`ack()` performs XACK and XDEL together, so stream length is exactly the count
-of pages admitted but not yet settled - backlog plus in-flight. Two properties
-matter:
-
-  * It is DERIVED, not counted. A separate "admitted pages" counter would have
-    to be decremented on completion, and a worker crashing between the terminal
-    transition and the decrement would leak the counter upward forever, which
-    tightens admission permanently. A derived signal cannot drift, and a
-    crashed worker's tasks stay in the PEL where they still correctly count.
-  * It is observable from outside: `XLEN stream:pages` plus
-    `XLEN stream:pages:lead` in redis-cli. Both lanes count - a page is
-    admitted-but-unsettled whichever one carries it, and reading only the
-    main stream would under-report by one page per in-flight job.
-
-Hysteresis, because one watermark flaps
----------------------------------------
-With a single threshold the system oscillates on every page completion: at the
-mark it rejects, one page drains so it accepts, the next job pushes it back
-over, and clients receive an unpredictable mix of 202s and 503s. Two marks make
-it a Schmitt trigger - trip at `high`, recover only at `low` - which is the
-same reason a thermostat does not switch at a single temperature.
-
-The flag has to be shared, so all API replicas agree on whether the system is
-currently shedding, and it is evaluated in the same script as the depth read so
-the two cannot disagree.
+Downstream backpressure (token bucket, retries, breaker, AIMD) all act
+after work is already in the queue, so none of it protects against
+ingestion - a client can POST a 100-page job in ~5ms, offering far more
+arrival rate than the 10 rps VLM can ever serve, and an unbounded queue
+just grows (measured: 40,000 pages offered with the watermark off queued
+39,998 of them; with it on, 6,000). A `503` carrying `Retry-After` is
+counted as handled, not dropped - the alternative (accept, then OOM-kill a
+worker and silently lose every in-flight page) is the actual drop. Depth
+is read from `XLEN` rather than a separate counter, because a derived
+signal can't drift: a separate "admitted pages" counter would need
+decrementing on completion, and a worker crashing between the terminal
+transition and the decrement would leak it upward forever. Two watermarks
+(high/low), not one, because a single threshold oscillates on every page
+completion - trip at `high`, recover only at `low`, the same reason a
+thermostat doesn't switch at one temperature.
 """
 
 from __future__ import annotations

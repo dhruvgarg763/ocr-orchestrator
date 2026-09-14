@@ -1,38 +1,18 @@
 """Mock inference engines - a tunable adversary for the orchestrator.
 
-Per the assignment spec:
-  POST /v1/predict/layout   50ms,        100 RPS,  2% failures
-  POST /v1/predict/vlm      1500-3000ms,  10 RPS,  5% failures
-
-Both endpoints share one code path (`_handle`) parameterised by bucket, latency
-and payload generator, so the ordering guarantees below are provably identical
-for both rather than duplicated and drifting.
-
-Request pipeline, in this exact order:
-
-  1. count the request
-  2. Idempotency-Key: replay from cache, or COALESCE onto an in-flight leader,
-     or become the leader. Either way, consuming NO token.
-  3. chaos rule             -> fault immediately, consuming NO token, no latency
-  4. token bucket           -> 429 immediately, no latency
-  5. sleep (base + chaos extra latency)
-  6. random failure         -> 500, token already spent
-  7. generate output; the leader then records + caches it
-
-Why that order:
-  - Replays are free because no model ran; charging a token for a cache hit
-    would throttle callers for work the server never did.
-  - Step 2 must handle in-flight duplicates, not just completed ones. The gap
-    between checking the cache and filling it is as wide as the model latency
-    (up to 3s), so a completed-result cache alone loses every concurrent
-    duplicate - see mock_model/idempotency.py.
-  - Chaos is evaluated before the bucket so the two mechanisms stay separable:
-    a chaos-rejected request must not silently consume rate-limit budget.
-  - Rate limiting precedes latency because a real gateway rejects at the edge
-    without doing work. It also keeps 429s *fast*, which matters: a slow 429
-    would delay the backpressure signal the orchestrator is waiting on.
-  - The random 500 comes AFTER the sleep and keeps its token, because that
-    models the model genuinely running and then failing.
+Per spec: layout 50ms/100rps/2% failures, VLM 1500-3000ms/10rps/5%
+failures. Both endpoints share one code path (`_handle`) parameterised by
+bucket, latency and payload generator, so the ordering guarantees are
+provably identical for both rather than duplicated and drifting. Fixed
+request order: Idempotency-Key check (replay from cache, or coalesce onto
+an in-flight leader - consuming no token either way, since the gap
+between checking and filling the cache is as wide as the model latency) ->
+chaos rule (no token, no latency) -> token bucket (429 immediately, no
+latency) -> sleep -> random failure (token already spent, models the
+model genuinely running and then failing) -> generate output. Rate
+limiting precedes latency because a real gateway rejects at the edge
+without doing work, and keeps 429s fast so the backpressure signal isn't
+itself delayed.
 """
 
 from __future__ import annotations

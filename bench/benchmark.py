@@ -2,49 +2,17 @@
 
     python bench/benchmark.py --jobs 50 --pages 20
 
-Runs on the HOST rather than in a container, for one reason: peak RSS is a
-container-level number and `docker stats` is the only place to get it. The
-graded metric says "system memory footprint", not one process's Python heap, so
-sampling `tracemalloc` inside the API would answer a different question and
-flatter us - it would miss the worker replicas entirely, and they are where the
-page work happens.
-
-What is measured, and the trap in each
---------------------------------------
-Peak RSS        Sampled from `docker stats` across api + all workers + redis +
-                mock-model, because the budget is for the system. Sampling only
-                the api would omit three worker replicas.
-
-TTFP            Ingestion to first SSE chunk. There is an unavoidable
-                serialisation here: the stream cannot be opened until POST /jobs
-                has returned a job id, so the connect is inside the measurement
-                whether or not the pipeline caused it. Reported as a breakdown -
-                post, connect, first frame - rather than one number, because
-                quoting only the last leg would be measuring the flattering
-                half.
-
-Page latency    From job submission to that page's `page.final`. NOT from the
-                page being claimed: nothing on the client can observe a claim,
-                and inventing a start time from the first event would exclude
-                exactly the queueing delay the percentiles exist to show.
-
-Drop rate       Pages with no terminal event, cross-checked three ways - SSE
-                events seen, GET /jobs/{id} state counts, and
-                `orch_pages_terminal_total` from /metrics. One source could be
-                wrong; three disagreeing is a finding rather than a number.
-
-Throughput      Pages per second over the whole run, wall clock. Includes ramp
-                and drain, deliberately: a figure that excludes them describes a
-                steady state this workload never reaches.
-
-The benchmark must not be the bottleneck
-----------------------------------------
-Fifty concurrent SSE streams plus a thousand page events from one Python process
-can saturate the CLIENT's event loop, at which point the percentiles describe
-this script and not the service. Two guards: the benchmark's own CPU time is
-measured and reported alongside wall clock, and the SSE read loop does no
-parsing beyond splitting frames. If `client_cpu_ratio` approaches 1.0 the
-numbers are suspect and the run says so.
+Runs on the HOST, not in a container, because peak RSS is a
+container-level number and `docker stats` is the only place to get it -
+sampling `tracemalloc` inside the API would miss the worker replicas
+entirely. TTFP is reported as a breakdown (post/connect/first-frame)
+rather than one number, since the stream cannot open before `POST /jobs`
+returns a job id, so quoting only the last leg would measure the
+flattering half. Drop rate is cross-checked three ways (SSE events seen,
+`GET /jobs` state counts, `/metrics`) since one source could be wrong. The
+benchmark's own CPU time is measured alongside wall clock
+(`client_cpu_ratio`), so a saturated client event loop is visible rather
+than silently describing itself instead of the service.
 """
 
 from __future__ import annotations

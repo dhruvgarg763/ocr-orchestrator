@@ -1,66 +1,22 @@
-"""Prometheus metrics: in-process primitives, text rendering, cross-container aggregation.
+"""Prometheus metrics: primitives, exposition rendering, cross-container
+aggregation.
 
-Three separate problems live here, and only the first is standard.
+Standard exposition format (counter/gauge/histogram, cumulative buckets,
+one HELP/TYPE per family - a non-cumulative bucket makes
+`histogram_quantile()` return plausible nonsense rather than an error, so
+`tests/test_metrics.py` asserts monotonicity directly). `prometheus_client`
+is deliberately not used: its multiprocess mode solves shared-filesystem
+gunicorn workers, not separate containers, so the aggregation problem below
+still has to be written by hand either way.
 
-1. The exposition format
-------------------------
-Plain text, one sample per line, with HELP and TYPE emitted once per family:
-
-    # HELP orch_pages_processed_total Pages reaching a terminal state.
-    # TYPE orch_pages_processed_total counter
-    orch_pages_processed_total{outcome="done"} 981
-
-Type choice is not cosmetic. A COUNTER is monotonic and nobody reads its
-value - they read `rate()` of it - so a decrease is a meaningful signal
-meaning "the process restarted", which Prometheus compensates for. A counter
-that decreases for any other reason silently corrupts every rate downstream.
-A GAUGE is a current value and may move either way.
-
-A HISTOGRAM has the trap: buckets are CUMULATIVE. `le="0.1"` counts everything
-at or below 0.1, including everything counted by `le="0.05"`, and a `le="+Inf"`
-bucket equal to `_count` is mandatory. Emit non-cumulative buckets and
-`histogram_quantile()` returns plausible nonsense rather than an error, so
-`tests/test_metrics.py` asserts monotonicity of the rendered buckets directly.
-
-2. Why not prometheus_client
-----------------------------
-It is the standard library for this and it is deliberately not used. Its
-multiprocess mode solves SHARED-FILESYSTEM gunicorn workers, not separate
-containers, so it does not address the problem in section 3 - the aggregation
-would still have to be written by hand. That leaves it rendering sixty lines of
-text in exchange for a dependency. The risk taken on is subtle format
-violations, which is why the rules above are tested rather than assumed.
-
-3. Counters that live in three places, one of them unreachable
---------------------------------------------------------------
-    queue depth, breaker, adaptive limit, admission   Redis      reachable
-    SSE subscribers, evaluate timings                 API proc   reachable
-    retries, 429s, page outcomes, in-flight, reaper   WORKER     not reachable
-
-Workers have no HTTP server, and `docker compose --scale worker=3` puts three
-containers behind one service name with no per-replica addressing - so the
-idiomatic answer (scrape each replica) leaves nothing for a grader to curl.
-
-So workers flush into Redis and the API aggregates on scrape. That inverts
-Prometheus's pull model for one hop and is stated rather than dressed up. The
-cost is bounded staleness of one flush interval.
-
-The subtlety that makes it work: counters flush DELTAS, gauges flush ABSOLUTES
------------------------------------------------------------------------------
-If each worker wrote its absolute counter to its own key and the API summed
-them, a restarted worker resets its own contribution to zero and the
-FLEET-WIDE SUM DROPS. Prometheus reads that as a single counter reset and
-mis-attributes it, so every rate across the window is wrong.
-
-Flushing deltas with HINCRBY into one shared key keeps the aggregate monotonic
-across worker restarts, because the shared key does not reset when a worker
-does. What it costs is up to one flush interval of counts if a worker dies
-mid-interval - bounded, and far cheaper than a Redis round trip per retry.
-
-Gauges need the opposite. A dead worker's in-flight count must DISAPPEAR, not
-sit at a stale value forever, so gauges go to per-worker keys carrying a TTL of
-a few missed flushes. Same liveness-by-TTL idea as the lease renewal in
-app/worker/reaper.py: absence of a heartbeat is the signal.
+Workers have no HTTP server and no per-replica addressing under
+`--scale worker=3`, so worker-side counters (retries, 429s, page outcomes,
+in-flight) flush into Redis and the API aggregates on scrape - one inverted
+hop, bounded by one flush interval of staleness. Counters flush as DELTAS
+via HINCRBY into a shared key, so a restarted worker's own reset doesn't
+drop the fleet-wide sum; gauges flush as per-worker keys with a TTL, so a
+dead worker's in-flight count disappears rather than sticking at a stale
+value.
 """
 
 from __future__ import annotations

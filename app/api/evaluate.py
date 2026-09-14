@@ -1,69 +1,16 @@
 """POST /evaluate - Module C's ground-truth comparison endpoint.
 
-Takes an extracted document tree and compares it against a ground-truth tree,
-returning all three required metrics: CER/WER, bounding-box IoU, and tree edit
-distance. The three algorithms live in app/eval/; this module is the boundary
-around them, and the boundary is where the two things they cannot do for
-themselves happen.
-
-One tree in, three metrics out
-------------------------------
-The spec asks for an endpoint that "takes an extracted document output tree and
-compares it against a ground-truth JSON schema", and a single tree is in fact
-enough for all three metrics, because the nodes carry everything:
-
-    {"type": "table",          -> the label TED compares
-     "bbox": [x, y, w, h],     -> the box IoU matches
-     "text": "...",            -> the text CER/WER scores
-     "children": [...]}
-
-So text is the concatenation of `text` in document order, boxes are every
-`bbox` present, and the structure is the labelled shape. Accepting three
-separate payloads would let them disagree about the same document, which is a
-class of bug the caller should not be able to express.
-
-Why every metric runs in a worker thread
-----------------------------------------
-All three are synchronous, CPU-bound Python. Called directly in the handler
-they would hold the event loop for their whole duration - and this process also
-serves every SSE stream and every job submission. Measured CPU cost, so the
-size of the problem is not in doubt:
-
-    tree edit distance   ~5 ms for a 50-node page, ~22 s for a 201-node
-                         caterpillar, quartic in between
-    CER                  ~1.1 s for a 2,000-character page pair
-
-A 22-second block would stall every in-flight stream on this worker, so the
-graded TTFP metric would fail for unrelated requests because somebody posted an
-awkward tree. `asyncio.to_thread` moves the whole computation off the loop in
-one hop; there is one hop rather than three because three would pay the handoff
-cost three times for no isolation benefit.
-
-Note precisely what the thread does and does not buy. The GIL means a
-CPU-bound thread still contends with the loop, so a long computation degrades
-throughput - it just no longer BLOCKS it, because the interpreter can switch
-between bytecode. Measured: a 47-node tree costs ~5 ms alone and up to ~58 ms
-with four competing CPU threads. That is the reason the work cap below exists
-as well: the thread bounds the blast radius, the cap bounds the cost.
-
-Why the guard runs before the algorithm, not inside it
-------------------------------------------------------
-Zhang-Shasha is O(n^4) in the worst case and the worst case is reachable with a
-small payload - a 201-node caterpillar is a few kilobytes of boring JSON and
-22 seconds of CPU, and a 1,000-node one projects to hours. No amount of care
-inside the DP helps; by the time it is running, the cost is already committed.
-
-What makes a pre-check possible is that the cost is predictable:
-`Tree.keyroot_weight` is O(keyroots) and the pass is Theta(W1 x W2). So both
-trees are parsed, their weights multiplied, and the request refused with 413 if
-the product exceeds `eval_max_ted_work` - before a single DP cell is touched.
-Parsing first is affordable because parsing is O(n) and bounded by
-`eval_max_nodes`.
-
-413 rather than 422: the payload is well-formed and the request is
-comprehensible, it is just too expensive to serve. That is what "Payload Too
-Large" means, and it is the same code `POST /jobs` returns for a document with
-too many pages.
+One tree in (predicted, against truth), all three metrics out - CER/WER,
+box IoU, and tree edit distance - because a single node payload
+(`type`/`bbox`/`text`/`children`) carries everything all three need, and
+accepting three separate payloads would let them disagree about the same
+document. All three are synchronous CPU-bound Python (TED alone: ~5ms for
+50 nodes, ~22s for a 201-node caterpillar), so the whole computation runs
+in one `asyncio.to_thread` hop - otherwise one awkward tree would stall
+every in-flight SSE stream on this process. The TED cost is bounded
+*before* computing, not inside the DP: `keyroot_weight` is O(keyroots) and
+predicts the Theta(W1*W2) cost, so an oversized tree gets a 413 before a
+single DP cell runs.
 """
 
 from __future__ import annotations

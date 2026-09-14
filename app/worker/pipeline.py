@@ -1,66 +1,24 @@
 """Process one page: layout, then VLM.
 
-Resume awareness is the payoff of committing each stage separately in Step 4: a
-page is dispatched to the stage its state says it needs, so a redelivered page
-never repeats a stage that has already been committed.
+Each stage commits separately, so a redelivered page resumes at the stage
+its state says it needs rather than repeating a committed one. Five
+outcomes, handled differently on purpose: DEGRADED (VLM exhausted, page
+out of budget -> FALLBACK_DONE with the committed layout output - a
+SUCCESS for zero-drop, fidelity lost, not the page); SATURATED (no
+token/open circuit, budget remaining -> requeued at full fidelity,
+nothing was consumed); HANDOFF (layout committed, page put back so a
+fresh slot claims the VLM stage rather than blocking on it); FAILED
+(layout itself could not complete - the one genuinely unrecoverable
+case); and a crash (nothing acked, the reaper recovers it).
 
-Four ways a page can end short of a full result, handled differently on purpose:
-
-  DEGRADED   the VLM could not produce a result AND the page is out of budget
-             to keep trying. Completes as FALLBACK_DONE carrying its
-             already-committed layout output plus a low confidence flag. A
-             SUCCESS for zero-drop purposes: output was produced, fidelity was
-             lost.
-  SATURATED  no rate-limit token, or an open circuit, with budget remaining.
-             Nothing was consumed; the claim is released and the task requeued
-             at FULL fidelity.
-  HANDOFF    layout committed and its `page.partial` event is out; the page is
-             put back so a fresh slot claims its VLM stage. Not a failure and
-             not a retry - see below.
-  FAILED     layout itself could not be completed, or the layout endpoint was
-             unavailable with no budget left. The genuinely unrecoverable case.
-  (crash)    the worker dies. Nothing is acknowledged, so the queue's pending
-             list holds the task and the reaper recovers it (Step 14).
-
-Degrading is a LAST RESORT, not a first response
-------------------------------------------------
-The spec is specific: "If retries are exhausted, fall back to Fast-Layout-Model
-with a low confidence flag." A page that arrives while the VLM's circuit is
-open has exhausted nothing - it never made the call - so degrading it there
-would be both off-spec and wasteful.
-
-Measured on an 80% rejection storm lasting 40s with a 5s breaker cooldown:
-degrading on the first open circuit produced 32 layout-only pages out of 40.
-Waiting instead gives each page ~8 deliveries of 3 attempts, putting
-P(never succeeding) near 0.5% - and the outage ends long before the page
-deadline. So a page holds out for full fidelity until `final_attempt`, and only
-then accepts a degraded result.
-
-Holding out costs no time-to-first-page: layout output streams as soon as it
-lands, and only the VLM upgrade waits.
-
-The asymmetry between the two stages is deliberate. The VLM degrades because a
-committed layout result is a usable answer - and needs no extra call, since
-that result is already in hand. Layout cannot degrade, because layout IS the
-fallback: a page with no layout has nothing to fall back to.
-
-Two events per page, and why the slot is released between them
---------------------------------------------------------------
-Each committed stage publishes to the job's result stream: `page.partial` when
-layout lands (~50ms), `page.final` when the page becomes terminal. Both are
-gated on the state transition having been made by THIS caller, so a redelivered
-page is a no-op on the notification path exactly as it is on the state path.
-
-The page is then handed back to the queue rather than held through the VLM
-stage. Holding it makes the fast stage inherit the slow stage's queueing: with
-48 worker slots and 1,000 pages every slot parks on a VLM token, later pages
-are never read off the queue at all, and their layout - which a 100 rps
-endpoint could do immediately - waits on a 10 rps one. Measured p95
-time-to-first-page went from 14.5s to under 1s.
-
-This adds no new state and no new recovery path. LAYOUT_DONE is already a
-durable checkpoint and already a legal resume point, so the redelivered page
-skips the stage it has committed - the same mechanism that makes a crash cheap.
+Degrading is a last resort: a page whose circuit is merely open has
+exhausted nothing, so it holds out for full fidelity until
+`final_attempt` rather than degrading on the first rejection (measured:
+holding out drops P(never succeeding) to ~0.5% under an 80% rejection
+storm, at no time-to-first-page cost since layout already streamed). The
+worker slot is released between stages rather than held through the VLM
+call - holding it lets the fast stage inherit the slow stage's queueing,
+measured at p95 TTFP 14.5s vs under 1s.
 """
 
 from __future__ import annotations

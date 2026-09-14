@@ -1,37 +1,17 @@
 """Worker-side metrics: instrument the events, derive the rest.
 
-Two kinds of metric live here and they are collected differently on purpose.
-
-Directly instrumented, because nothing else counts them
--------------------------------------------------------
-Model call outcomes, model call duration, rate-limit waits, retries, page
-duration. These are events with no existing home, so the call sites increment
-them.
-
-Derived at flush time from state that already exists
-----------------------------------------------------
-Page outcomes (`WorkerStats.outcomes`), reaper actions (`ReaperStats`),
-in-flight count (`Worker._held`). These already have an owner that the worker's
-shutdown log reads, and adding a parallel counter next to each one would create
-a second place for the same number to be wrong. So `sync()` reads the existing
-objects and pushes the DIFFERENCE since the previous flush.
-
-That difference is the whole reason this is not simply "call inc() everywhere":
-`WorkerStats.outcomes` is an absolute running total, and
-`common.metrics.MetricsSink` flushes counters as deltas into a shared Redis
-hash. Feeding it absolutes would add the full lifetime total on every flush, so
-a worker up for an hour with 100 pages would report tens of thousands. The
-subtraction is not bookkeeping tidiness; it is what makes the aggregate mean
-anything.
-
-What a worker restart does to each kind
----------------------------------------
-An instrumented counter loses at most one flush interval - whatever was
-accumulated but not yet pushed. A derived counter loses the same, and its
-baseline resets to zero, which is correct: the fleet-wide Redis total already
-holds everything previously flushed, and the new process starts counting from
-its own zero. The shared total therefore never goes backwards when a worker
-dies, which is precisely what Prometheus needs from a counter.
+Model call outcomes/duration, rate-limit waits, retries, and page duration
+are instrumented directly at the call site since nothing else counts
+them. Page outcomes, reaper actions, and in-flight count are DERIVED at
+flush time from state that already has an owner (`WorkerStats`,
+`ReaperStats`, `Worker._held`), rather than duplicated into a parallel
+counter that could drift from it. `sync()` pushes the DIFFERENCE since
+the last flush, because those objects are absolute running totals while
+`common.metrics.MetricsSink` flushes counters as deltas into a shared
+Redis hash - feeding it absolutes would report the full lifetime total on
+every flush. A worker restart loses at most one flush interval either
+way, and the fleet-wide total never goes backwards, which is what
+Prometheus needs from a counter.
 """
 
 from __future__ import annotations

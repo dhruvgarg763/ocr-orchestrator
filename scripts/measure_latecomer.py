@@ -1,24 +1,14 @@
 """Time-to-first-page for a job that arrives INTO a busy system.
 
-The scenario scripts/measure_ttfp.py structurally cannot test. There, every job
-is submitted at t=0 into an empty system, so worker slots are free and the
-priority lane drains immediately. The interesting case is the opposite and the
-more realistic one: the system is already saturated with VLM-stage work, and a
-new client shows up.
+The case scripts/measure_ttfp.py can't test, since there every job starts
+at t=0 into an empty system. Two suspected defects, measured separately:
+(A) a single-page job on an idle system - it goes entirely to the lead
+lane, but the dispatch loop's blocking read watches only the main stream,
+so nothing wakes an idle worker; (B) any job arriving while every slot is
+occupied - the lead probe only runs when capacity > 0, so a saturated
+system doesn't poll the lane at all.
 
-Two suspected defects, measured separately:
-
-  A  single-page job on an IDLE system. All of a 1-page job goes to the lead
-     lane, and the dispatch loop's blocking read watches only the MAIN stream -
-     so nothing wakes an idle worker and the page waits out worker_block_ms. A
-     multi-page job hides this, because its main-lane pages do the waking.
-
-  B  any job arriving while every slot is occupied. The lead probe only happens
-     when capacity > 0, so while saturated the lane is not polled at all and a
-     first page waits for a slot to free.
-
-Usage:
-    python scripts/measure_latecomer.py [mode]      mode: idle | busy | both
+Usage: python scripts/measure_latecomer.py [mode]   mode: idle | busy | both
 """
 
 from __future__ import annotations

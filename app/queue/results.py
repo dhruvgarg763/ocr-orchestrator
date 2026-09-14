@@ -1,52 +1,19 @@
 """Per-job result stream: what the SSE endpoint tails.
 
-A separate stream per job (`stream:out:{job_id}`), not one shared output
-stream. Two reasons, both load bearing:
+One stream per job (`stream:out:{job_id}`), not shared, so a subscriber
+never has to read and discard other jobs' events, and one busy job's
+`MAXLEN` eviction can't starve a quiet job's client. `MAXLEN` is used here
+(unlike the task stream, see streams.py) because these entries are
+notifications of state already durably committed to the page hash -
+dropping the oldest costs a client a re-read of `GET /jobs/{id}`, not a
+lost page.
 
-  * a subscriber wants one job's events, and `XREAD` has no server-side filter.
-    On a shared stream a client watching a 5-page job would have to read and
-    discard every event of the other 49 concurrent jobs to find its own.
-  * MAXLEN is per stream. Shared, one busy job's events would evict a quiet
-    job's, so the quiet job's client would lose events it never had a chance to
-    read. Per job, a slow client can only ever hurt itself.
-
-Why MAXLEN here but NOT on the task stream
-------------------------------------------
-`stream:pages` deliberately has no MAXLEN (see streams.py): trimming discards
-the OLDEST entries, and the oldest entry in a task queue is unprocessed work -
-a memory bound that eats your jobs.
-
-Here the opposite holds. These entries are a *notification* of state that is
-already durably committed to the page hash, so the stream is a cache, not the
-record. Dropping the oldest event costs a client a re-read of
-`GET /jobs/{id}`; dropping the oldest task would lose a page. Different data,
-different trimming policy - and this is the distinction to make if asked why
-one stream is capped and the other is not.
-
-Why `seq` is assigned inside the XADD
--------------------------------------
-The obvious version is two commands:
-
-    seq = await r.incr(seq_key)          # worker A gets 7, worker B gets 8
-    await r.xadd(stream, {"seq": seq})   # B's XADD lands first
-
-Now the stream holds seq 8 before seq 7. A client that orders by `seq` but
-dedupes by entry id sees seq 7 arrive "late" and can never tell whether it is
-a reordering or a gap it should resync over. Assigning the counter and
-appending the entry in one script makes seq order and stream order the same
-order, by construction, with no coordination between workers.
-
-That matters because `seq` and the entry id do different jobs and neither can
-replace the other:
-
-    entry id   an opaque RESUME CURSOR. Redis-assigned, usable directly as
-               `XREAD` start, which is exactly what SSE `Last-Event-ID` needs.
-    seq        a dense APPLICATION ORDER. Comparable, so a client can detect a
-               hole; countable, so it can tell "I have 41 of 41 events".
-
-An entry id cannot be used for the second job - `1738-0` to `1740-0` tells you
-nothing about whether an entry existed in between - and seq cannot be used for
-the first, because `XREAD` does not accept it.
+`seq` is assigned inside the same script that appends the entry, not via a
+separate `INCR` beforehand - a separate counter lets two workers' increment
+and append interleave, so seq 8 can land in the stream before seq 7. `seq`
+and the entry id do different jobs: the id is an opaque resume cursor for
+`Last-Event-ID`; `seq` is a dense, comparable application order a client
+can use to detect a gap.
 """
 
 from __future__ import annotations

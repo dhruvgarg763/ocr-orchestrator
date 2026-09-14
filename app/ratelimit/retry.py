@@ -1,39 +1,15 @@
 """Error classification and backoff computation.
 
-Pure functions, no I/O: the interesting logic here is a decision table and a
-probability distribution, and both deserve to be tested without a network.
-
-Why classification matters
---------------------------
-Retrying the wrong error is worse than not retrying at all - the budget is spent
-and the failure is merely delayed. A 400 is permanent: a malformed request stays
-malformed. A 429 is the server explicitly saying "later". Conflating them wastes
-the endpoint's capacity on requests that can never succeed.
-
-Why full jitter
----------------
-Plain exponential backoff makes every client that failed together retry at the
-same instants (200ms, 600ms, 1400ms...), recreating the overload that caused the
-failure. Simulated with 60 clients and 4 attempts each, counting requests that
-would be rejected by a 10-concurrent server:
-
-    no jitter      peak 60 req/20ms    200 rejected
-    equal jitter   peak 17 req/20ms     14 rejected
-    FULL jitter    peak 12 req/20ms      5 rejected
-
-Full jitter - a uniform draw over the whole window rather than half of it -
-gives 40x fewer rejections than none. It is counter-intuitive because the
-average wait is shorter than equal jitter, yet it performs better: spreading
-arrivals matters more than waiting longer.
-
-On retrying timeouts
---------------------
-A timeout means you do not know whether the work happened - the request may
-have completed with the response lost in transit. Retrying a non-idempotent
-operation there double-charges. It is safe here only because every request
-carries a deterministic `Idempotency-Key` (app/worker/client.py), so a replay is
-served from cache instead of re-running a 3-second inference. Retries and
-idempotency are a matched pair; neither is safe alone.
+Pure functions, no I/O. Classification matters because retrying the wrong
+error wastes budget on a failure that is merely delayed - a 400 is
+permanent, a 429 is the server saying "later". Full jitter (a uniform
+draw over the whole backoff window, not half of it) beats both no jitter
+and equal jitter at avoiding synchronised retry storms: simulated with 60
+clients retrying together against a 10-concurrent server, full jitter
+gave 40x fewer rejections than none. Retrying a timeout is only safe here
+because every request carries a deterministic `Idempotency-Key`
+(app/worker/client.py) - a timeout means the work MAY have completed, and
+without idempotency a retry would double-charge it.
 """
 
 from __future__ import annotations

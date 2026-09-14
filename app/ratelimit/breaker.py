@@ -1,44 +1,15 @@
 """Distributed circuit breaker, evaluated inside Redis.
 
-What it is for
---------------
-Retries handle sparse faults. They cannot handle a sustained outage: under an
-80% rejection rate, three attempts leave 0.8^3 = 51% of pages failing, and
-buying 99% success would need 21 attempts - 21x the load on an endpoint that is
-already rejecting everything. At that point the right move is to stop asking.
-
-State machine
--------------
-                 failure ratio >= threshold
-    CLOSED  ---------------------------------->  OPEN
-       ^                                           |  cooldown elapsed
-       |   N consecutive probe successes           v
-       +--------------------  HALF_OPEN  <---------+
-                                  |  any probe fails
-                                  +---> OPEN (cooldown restarts)
-
-Why HALF_OPEN rather than simply closing on a timer: closing on a timer sends
-full production load at a service that may still be dead, which re-kills it and
-restarts the cycle. HALF_OPEN admits a handful of probes instead, so a still-
-broken endpoint costs 3 requests to re-detect rather than 3,000.
-
-Why the state lives in Redis
-----------------------------
-With per-process breakers, every replica must independently discover the same
-outage, and each keeps hammering until it does - so the blast radius scales with
-replica count, exactly like the in-process rate limiter did. Shared state means
-one replica discovers the outage and all of them stop.
-
-Why a minimum volume
---------------------
-With 2 requests and 1 failure, a 50% ratio threshold trips on noise. min_volume
-stops a quiet endpoint from opening on a single unlucky call.
-
-Why a rolling window
---------------------
-Counters that never reset would remember an outage from an hour ago and keep the
-ratio elevated forever. The window bounds the memory of the breaker to recent
-history, which is the only history that predicts the next request.
+Retries handle sparse faults, not a sustained outage: under an 80%
+rejection rate, buying 99% success needs 21 attempts against an endpoint
+already rejecting everything. `CLOSED -> OPEN` on a failure-ratio
+threshold (gated by a minimum call volume, so 1 failure in 2 calls can't
+trip it), `OPEN -> HALF_OPEN` after a cooldown, `HALF_OPEN -> CLOSED`
+after N consecutive probe successes or back to `OPEN` on any failure.
+`HALF_OPEN` rather than closing on a timer, because a timer sends full
+production load at a service that may still be dead. State lives in
+Redis so one replica's discovery of an outage stops all of them, rather
+than each independently re-discovering it.
 """
 
 from __future__ import annotations

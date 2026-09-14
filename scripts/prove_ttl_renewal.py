@@ -1,28 +1,17 @@
 """A job that takes longer than its own `result_ttl_s` must still complete.
 
-Run against a stack started with a deliberately tiny TTL:
+Run against a stack with a deliberately tiny TTL:
 
     ORCH_RESULT_TTL_S=5 docker compose up -d --force-recreate --scale worker=3
     docker compose exec -T api python /tmp/ttl.py <pages> <ttl_s>
 
-Why this needs a live stack rather than only a unit test
--------------------------------------------------------
-The unit test drives `transition` directly, so it proves the script renews what
-it says it renews. It cannot prove the renewal covers every key the REAL
-pipeline depends on while a job is in flight - the job hash, every page hash
-including ones no worker has claimed yet, and the result stream that SSE reads
-from. Those are touched by different code paths (the state script, the
-conditional page sweep, and results.py's own EXPIRE), and the only way to know
-they agree is to run a job that outlives the TTL and watch for the one event
-that requires all of them: `job.complete`.
-
-The failure this detects
-------------------------
-Before TTL renewal, the job hash expired partway through and `HINCRBY` silently
-recreated it without `total_pages`, so `completed_job` could never be true
-again. Every page kept processing correctly and the job simply never reported
-complete - a hang at 99% with nothing in the logs, and an SSE client waiting out
-`sse_max_duration_s` for an event that could no longer exist.
+Needs a live stack because the failure this catches spans several code
+paths that a unit test can only check in isolation - the state script's
+renewal, the conditional page sweep, and `results.py`'s own `EXPIRE` - and
+the only way to know they agree is to run a job that outlives the TTL and
+watch for `job.complete`. Before renewal, the job hash expired mid-job and
+`HINCRBY` silently recreated it without `total_pages`, hanging the job at
+99% with nothing in the logs.
 """
 
 from __future__ import annotations

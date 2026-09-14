@@ -1,50 +1,18 @@
 """Server-Sent Events: tail one job's results as they land.
 
-Why SSE and not WebSockets
---------------------------
-The traffic is one-directional - the server pushes page results, the client says
-nothing after the request line. SSE is plain HTTP with a streaming body, so it
-keeps every piece of ordinary HTTP infrastructure (status codes for errors,
-`Last-Event-ID` resume, proxies, curl) and needs no framing library. A WebSocket
-would add a protocol upgrade, its own ping/pong liveness scheme and its own
-reconnect story to buy a direction we never use.
-
-Why each page is announced TWICE
---------------------------------
-Time-to-first-page is graded at under 200ms. A VLM call takes 1.5-3s. Those two
-numbers cannot both be satisfied by a stream that emits one event per finished
-page - the target is smaller than one call, so no amount of concurrency,
-prefetching or queue tuning gets there. The constraint is arithmetic, not
-engineering.
-
-So a page is announced when its FAST stage commits and again when its heavy
-stage does:
-
-    page.partial   layout committed, ~50ms, `complete: false`
-    page.final     terminal state,   ~1.5-3s, `complete: true`
-
-Same `page_index`, so a client upgrades in place rather than appending. First
-byte then depends on the 50ms stage, and the 3s stage becomes an upgrade. This
-is also why the pipeline commits layout separately (see queue/state.py) - the
-checkpoint that makes crash recovery cheap is the same checkpoint that makes
-this event possible.
-
-Out-of-order delivery
----------------------
-Pages are dispatched concurrently and VLM latency varies by ~2x, so page 10 will
-routinely settle before page 2. The stream does NOT reorder them: buffering
-until page 2 arrives would idle the client for the slowest page in the job and
-reintroduce head-of-line blocking - which is the exact thing per-page streaming
-exists to avoid. Every event carries `page_index`, so reassembly is the client's
-job and costs it a dictionary.
-
-Three identifiers, three jobs
------------------------------
-    stream_id    the SSE `id:` field. An opaque RESUME cursor, fed straight
-                 back to XREAD on reconnect.
-    seq          dense per-job counter. Comparable and countable, so a client
-                 can prove it has every event rather than hoping.
-    page_index   which page this is about. The reassembly key.
+SSE over WebSockets because the traffic is one-directional, and SSE keeps
+ordinary HTTP infrastructure (status codes, `Last-Event-ID` resume,
+proxies, curl) for free. Each page is announced TWICE - `page.partial`
+when layout commits (~50ms, `complete:false`) and `page.final` when the
+page is terminal (~1.5-3s) - because the 200ms TTFP target is smaller than
+a single VLM call, so no amount of concurrency tuning closes that gap; the
+two events share `page_index` so a client upgrades in place. Pages are NOT
+reordered before streaming - buffering for a slow page would reintroduce
+the head-of-line blocking per-page streaming exists to avoid - so
+`page_index` is what a client reassembles by. Three identifiers do three
+separate jobs: `stream_id` (opaque resume cursor for `Last-Event-ID`),
+`seq` (dense per-job counter, so a client can prove it has every event),
+`page_index` (the reassembly key).
 """
 
 from __future__ import annotations

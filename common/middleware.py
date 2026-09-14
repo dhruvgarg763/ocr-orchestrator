@@ -1,16 +1,10 @@
 """Per-request trace context binding.
 
-Deliberately a *pure ASGI* middleware rather than Starlette's
-`BaseHTTPMiddleware`, for two reasons:
-
-1. BaseHTTPMiddleware runs the downstream app in a separate asyncio task. Context
-   copies into that task, but writes made inside the endpoint do not propagate
-   back out - so anything the handler binds is invisible to the middleware.
-2. It buffers/interferes with long-lived streaming responses. Module B streams SSE
-   for the lifetime of a job, so that is disqualifying.
-
-Pure ASGI middleware runs in the same task as the endpoint: no extra task, no
-copy, no streaming interference.
+Pure ASGI middleware, not Starlette's `BaseHTTPMiddleware`, because that
+runs the downstream app in a separate asyncio task - context copies in,
+but writes the handler makes don't propagate back out - and it buffers
+streaming responses, which disqualifies it for Module B's long-lived SSE
+streams.
 """
 
 from __future__ import annotations

@@ -1,53 +1,18 @@
 """Redis connection lifecycle.
 
-Replaces the old module-level `app/redis_client.py`, which created a client at
-import time. That is a real bug, not a style preference: import runs before the
-event loop exists, so an async client built there binds its internal state to
-the wrong loop and fails with "attached to a different loop" once a request
-arrives. Long-lived async resources must be created inside the running loop,
-which is what `lifespan` gives us.
-
-The pool is bounded (`max_connections`) as a memory and file-descriptor ceiling:
-every connection holds its own read/write buffers.
-
-It uses BlockingConnectionPool, NOT the default ConnectionPool. This is load
-bearing. redis-py's default pool *raises* MaxConnectionsError the moment all
-connections are checked out; BlockingConnectionPool makes the calling task wait
-for one. With 50 concurrent jobs and 1,000 pages contending for ~32 connections,
-the default would turn ordinary contention into a storm of unhandled exceptions
-and dropped pages - which is precisely the zero-drop guarantee we are graded on.
-Waiting turns pool exhaustion into backpressure; raising turns it into data loss.
-
-The wait is bounded by `pool_timeout` rather than infinite: blocking forever
-would convert a Redis outage into a silent hang with no error and no metric.
-
-Two pools, not one
-------------------
-A second pool exists for long-BLOCKING reads (the SSE tailer). Both problems it
-solves were measured, not anticipated:
-
-1. `socket_timeout` and `BLOCK` are in direct conflict. The socket timeout is
-   how a wedged Redis is detected - no reply within N seconds means something
-   is wrong. But a blocking command legitimately sends nothing for its entire
-   block duration, so a 5s socket timeout against `XREAD BLOCK 15000` reads
-   normal blocking as a dead server. Measured: every SSE stream died at ~5s
-   with redis.exceptions.TimeoutError, and because a streaming body has
-   already sent its status, the client saw a truncated response
-   ("incomplete chunked read") rather than an error it could act on.
-
-   The worker's own blocking read escaped this only because `worker_block_ms`
-   (2s) happened to sit below the 5s timeout - two independently chosen numbers
-   in two different files, with nothing expressing the relationship. Deriving
-   this pool's timeout FROM the block duration is what makes it a rule instead
-   of a coincidence.
-
-2. A blocked reader holds its connection for the whole block. redis-py checks a
-   connection out for the duration of a command, so N subscribers blocked in
-   XREAD occupy N connections. The benchmark runs 50 concurrent jobs against a
-   32-connection pool: the 33rd subscriber would wait out `pool_timeout` and
-   fail, and - far worse - so would ingestion, because it draws from the same
-   pool. A subscriber is a nice-to-have; accepting a job is not. Separate pools
-   make that priority structural rather than a matter of who arrives first.
+Two `BlockingConnectionPool`s, not one, and not the default
+`ConnectionPool`. `BlockingConnectionPool` makes a caller WAIT for a
+connection instead of raising `MaxConnectionsError` - with 50 concurrent
+jobs contending for ~32 connections, the default would turn ordinary
+contention into unhandled exceptions and dropped pages. A second pool
+exists for long-BLOCKING reads (the SSE tailer): a single `socket_timeout`
+against `XREAD BLOCK 15000` reads normal blocking as a dead server
+(measured: every SSE stream died at ~5s), and a blocked reader holds its
+connection for the whole block, so N subscribers would starve ingestion
+out of the same pool it needs to admit jobs. Clients are constructed
+inside FastAPI's `lifespan`, not at import time - an async client built
+before the event loop exists binds to the wrong loop and fails later with
+"attached to a different loop".
 """
 
 from __future__ import annotations

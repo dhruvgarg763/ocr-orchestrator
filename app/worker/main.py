@@ -2,82 +2,25 @@
 
 Run with `python -m app.worker.main`.
 
-Concurrency model: BOUNDED DISPATCH
------------------------------------
-The worker never reads more tasks than it has free capacity to run:
+Bounded dispatch: the worker never reads more tasks than it has free
+capacity to run (`capacity = concurrency - in_flight`), so resident tasks
+are always <= worker_concurrency regardless of queue depth - reading
+everything and guarding execution with a semaphore instead would still
+move every task into this consumer's Pending Entries List up front. Two
+lanes (lead/main) partition that capacity so a job's first page is never
+queued behind other jobs' later pages. Rate limiting and the circuit
+breaker are shared through Redis so a limit or an outage discovery holds
+across all replicas, not just this one.
 
-    capacity = concurrency - len(in_flight)
-    tasks    = await queue.read(lead_count=..., main_count=...)
-
-The tempting alternative is to read everything and guard execution with a
-semaphore:
-
-    sem = asyncio.Semaphore(16)
-    async with sem: await process_page(task)      # the rest park here
-
-That bounds concurrent *execution* but not what the process *holds*. By the time
-the semaphore is consulted you have already created N coroutine objects (~3.2 KB
-each, measured) and - worse - already read N tasks off the stream, moving every
-one of them into this consumer's Pending Entries List. Die at that point and all
-N need reclaiming rather than the handful actually being worked on.
-
-Bounded dispatch leaves the backlog in Redis, which is where a backlog belongs:
-durable, observable via XLEN, and someone else's memory. Resident tasks are
-<= worker_concurrency by construction, whether the queue holds 10 pages or
-100,000.
-
-Failure isolation: each page runs as its own task and _handle catches
-everything, so one poisoned page cannot take down the dispatch loop or its
-siblings. With `asyncio.gather` over a batch, one unhandled exception would
-abandon the whole batch.
-
-Rate limiting (Step 7) is a shared Redis token bucket per endpoint, so the
-limit holds across replicas: N in-process buckets would have permitted N x the
-intended rate. Calls wait for a token instead of being rejected downstream,
-which is the difference between backpressure and load shedding.
-
-A circuit breaker (Step 9) sits in front of the limiter, also shared through
-Redis so one replica's discovery of an outage stops all of them. When the VLM is
-unavailable a page degrades to its committed layout output rather than failing,
-which is what makes the zero-drop guarantee achievable.
-
-Two lanes, and a budget partitioned between them
-------------------------------------------------
-Page 0 of every job goes to a priority lane (`stream:pages:lead`) so that a
-job's FIRST page is not read behind other jobs' later pages - under one FIFO
-stream the 50th job's first page sat at queue position ~980 and p95
-time-to-first-page was 14.5s. `worker_lead_reserve` slots are withheld from the
-main lane so a first page always has somewhere to run, which matters because
-bounded dispatch only reads when a slot is free.
-
-Acknowledgement policy - four distinct outcomes, four responses:
-
-  terminal   ack. DONE, FALLBACK_DONE or FAILED: the page is finished, for
-             better or worse, and redelivery would gain nothing.
-  HANDOFF    REQUEUE without spending an attempt, and do not pause. Layout is
-             committed and its page.partial is already on every subscriber's
-             stream; the page goes back so a fresh slot claims its VLM stage
-             rather than this one blocking for 1.5-3s on a 10 rps endpoint.
-             Progress, not congestion - so it must not be charged against the
-             attempt budget or every page would spend one on its happy path.
-  SATURATED  REQUEUE, do not ack, then pause this slot briefly. Nothing was
-             attempted and nothing degraded, so holding the page would pin a
-             worker that could be serving others. Bounded by the page deadline.
-  crash      neither. The task stays in the Pending Entries List, which is the
-             safety net Step 14 harvests.
-
-Crash recovery, in four layers (Step 14)
-----------------------------------------
-  per-stage commits  a crash costs one stage, not the page.
-  read_own_pending   a worker RESTARTING under the same name (the container
-                     hostname) resumes its own interrupted work at once.
-  the reaper         a worker REPLACED rather than restarted leaves PEL entries
-                     owned by a name that will never return. `_maintenance`
-                     renews leases on what this worker holds and reclaims what
-                     nobody is renewing - see app/worker/reaper.py.
-  Idempotency-Key    a duplicate delivery never becomes a duplicate model call,
-                     which is what makes all of the above safe to be
-                     aggressive about.
+Four outcomes drive four different ack policies: terminal states ack;
+`HANDOFF` requeues without spending an attempt (layout is committed,
+freeing this slot for the next VLM call rather than blocking on it);
+`SATURATED` requeues and pauses this slot briefly (nothing was attempted,
+so holding the page would waste capacity); a crash leaves the task in the
+PEL, which the reaper harvests. Crash recovery is four layers: per-stage
+commits, `read_own_pending` on restart, the reaper's `XAUTOCLAIM` when a
+worker is replaced rather than restarted, and an Idempotency-Key so a
+duplicate delivery never becomes a duplicate model call.
 """
 
 from __future__ import annotations

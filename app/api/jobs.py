@@ -1,35 +1,17 @@
 """Job ingestion and status.
 
-Three ways in, deliberately:
-
-  POST /jobs          a page COUNT and no document. Lets the benchmark drive
-                      1,000 pages without shipping 50 real PDFs.
-  POST /jobs/stream   a PDF as a raw request body. The memory-optimal path.
-  POST /jobs/upload   a PDF as multipart. What a browser or `curl -F` sends.
-
-All three converge on `_admit_and_enqueue`, so the admission invariants below
-are stated and enforced exactly once.
-
-Ordering inside create_job matters and is not arbitrary:
-
-  1. 413        - validation: a job this large is never servable
-  2. 503        - capacity: the queue is too deep to accept more right now
-  3. init_job   - create every page's state row
-  4. enqueue    - publish the tasks
-
-Steps 2, 3 and 4 all run under a single process-local lock. The capacity check
-and the enqueue that satisfies it are separate Redis round trips, so without
-serialising them concurrent requests each admit against the same pre-enqueue
-depth - measured at 130-150% overshoot at the benchmark's 50-way concurrency,
-with one trial admitting 1,000 pages against a 400 limit and shedding nothing.
-
-Steps 3 and 4 must not be reversed: a worker could otherwise pick up page 7
-before its state row existed and see MISSING. State before work, always.
-
-Steps 1 and 2 are also ordered deliberately. 413 is a property of the request
-and cheap to check; running the capacity check first would spend a Redis round
-trip on a job that could never be served at any depth, and would file it under
-"shed for capacity" when it was really malformed.
+Three ways in - `POST /jobs` (page count, no document, for the
+1,000-page benchmark), `/jobs/stream` (raw PDF body, memory-optimal),
+`/jobs/upload` (multipart) - all converging on `_admit_and_enqueue` so
+admission is stated and enforced exactly once. Order inside `create_job`
+is deliberate and not swappable: 413 (cheap request validation) before
+503 (a capacity check, so a malformed job isn't misfiled as "shed for
+capacity"), and `init_job` (state rows) before `enqueue` (tasks), since a
+worker could otherwise pick up a page before its state row exists. The
+capacity check and the enqueue that satisfies it run under one
+process-local lock - without it, concurrent requests admit against the
+same pre-enqueue depth (measured: 130-150% overshoot at 50-way
+concurrency).
 """
 
 from __future__ import annotations
