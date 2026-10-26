@@ -1,4 +1,4 @@
-# Sarvam Vision Orchestrator
+# OCR Orchestrator Pipeline
 
 High-throughput OCR pipeline orchestrator: ingests multi-page document jobs,
 schedules page-level tasks across heterogeneous mock inference endpoints with
